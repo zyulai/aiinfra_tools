@@ -26,6 +26,7 @@ import json
 import os
 import sys
 import shutil
+from dataclasses import replace
 
 # Allow running as script
 if __package__ is None or __package__ == "":
@@ -65,16 +66,24 @@ def generate_model(
 ):
     """Main generation pipeline."""
     
-    # Override num_layers if truncating
+    # Keep the loaded model intact when generating a truncated checkpoint.
     overrides = {}
-    if num_layers is not None and num_layers != cfg.num_hidden_layers:
-        overrides["num_hidden_layers"] = num_layers
-        cfg.num_hidden_layers = num_layers
-        if verbose:
-            print(f"\n⚠ Truncated to {num_layers} layers (original: {cfg.num_hidden_layers} → {num_layers})")
+    original_layers = cfg.num_hidden_layers
+    if num_layers is not None:
+        if not 1 <= num_layers <= original_layers:
+            raise ValueError(f"num_layers must be between 1 and {original_layers}")
+        if num_layers != original_layers:
+            overrides["num_hidden_layers"] = num_layers
+            cfg = replace(cfg, num_hidden_layers=num_layers)
+            if verbose:
+                print(f"\n⚠ Truncated layers: {original_layers} → {num_layers}")
 
-    # Compute weight map for this rank
-    entries = build_weight_map(cfg, pc)
+    errors = pc.validate(cfg, include_warnings=False)
+    if errors:
+        raise ValueError("Invalid parallel configuration: " + "; ".join(errors))
+
+    # Compute sizes using the selected precision before displaying the plan.
+    entries = build_weight_map(cfg, pc, dtype=dtype)
     total_bytes = compute_total_bytes(entries)
     per_layer_bytes = compute_per_layer_bytes(entries)
 
@@ -100,12 +109,11 @@ def generate_model(
         print(f"  Total:        {format_bytes(total_bytes)}")
         print(f"  Full model:    {format_bytes(total_bytes)} (random, no download needed)")
 
-    # Validate
-    errors = pc.validate(cfg)
-    if errors:
-        print(f"\n⚠ Validation warnings:")
-        for e in errors:
-            print(f"  - {e}")
+    warnings = pc.validation_warnings(cfg)
+    if warnings:
+        print("\n⚠ Validation warnings:")
+        for warning in warnings:
+            print(f"  - {warning}")
 
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
@@ -140,10 +148,6 @@ def generate_model(
         print("Step 2: Generate Random Weights")
         print(f"{'='*60}")
     
-    # Set dtype on all entries
-    for e in entries:
-        e.dtype = dtype
-
     # Determine which rank(s) to generate
     ranks_to_gen = range(pc.tp) if all_ranks else [rank]
     

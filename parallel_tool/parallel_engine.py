@@ -9,8 +9,8 @@ Strategies:
   DP  Data Parallel     — full replication
   SP  Sequence Parallel — split sequence in non-attention regions (works with TP)
 """
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
+from math import prod
 from .config_parser import ModelConfig
 from .model_kernels import KernelSpec
 
@@ -31,58 +31,54 @@ class ParallelConfig:
     def world_size(self) -> int:
         return self.tp * self.pp * self.cp * self.dp * (self.ep if self.ep > 1 else 1)
 
-    def validate(self, cfg: ModelConfig) -> list[str]:
-        """Validate against model config; return list of error messages (empty = OK)."""
+    def validate(self, cfg: ModelConfig, *, include_warnings: bool = True) -> list[str]:
+        """Validate dimensions; optionally include non-fatal layout warnings."""
         errors = []
+        for name in ("tp", "pp", "cp", "ep", "dp"):
+            size = getattr(self, name)
+            if not isinstance(size, int) or isinstance(size, bool) or size < 1:
+                errors.append(f"{name.upper()} must be a positive integer (got {size})")
+        if errors:
+            return errors
+        if cfg.num_hidden_layers < 1:
+            errors.append("Model must have at least one hidden layer")
+        if self.pp > cfg.num_hidden_layers:
+            errors.append(f"PP={self.pp} exceeds num_hidden_layers={cfg.num_hidden_layers}")
         if self.tp > 1:
-            if cfg.num_attention_heads % self.tp != 0:
-                errors.append(
-                    f"TP={self.tp} must divide num_attention_heads={cfg.num_attention_heads}"
-                )
-            if cfg.kv_heads % self.tp != 0:
-                # GQA with KV heads not divisible by TP — need to handle
-                errors.append(
-                    f"TP={self.tp} must divide num_key_value_heads={cfg.kv_heads} "
-                    f"(consider TP={self._nearest_divisor(cfg.kv_heads, self.tp)})"
-                )
-            if cfg.intermediate_size % self.tp != 0:
-                errors.append(
-                    f"TP={self.tp} must divide intermediate_size={cfg.intermediate_size}"
-                )
-            if cfg.vocab_size % self.tp != 0:
-                errors.append(
-                    f"TP={self.tp} must divide vocab_size={cfg.vocab_size}"
-                )
-        if self.pp > 1:
-            if cfg.num_hidden_layers % self.pp != 0:
-                errors.append(
-                    f"PP={self.pp} does not evenly divide num_hidden_layers={cfg.num_hidden_layers} "
-                    f"(will be uneven: some stages get {cfg.num_hidden_layers // self.pp + 1} layers, "
-                    f"others get {cfg.num_hidden_layers // self.pp})"
-                )
+            dimensions = {
+                "num_attention_heads": cfg.num_attention_heads,
+                "num_key_value_heads": cfg.kv_heads,
+                "vocab_size": cfg.vocab_size,
+                "moe_intermediate_size" if cfg.is_moe else "intermediate_size":
+                    (cfg.moe_intermediate_size or cfg.intermediate_size)
+                    if cfg.is_moe else cfg.intermediate_size,
+            }
+            for name, size in dimensions.items():
+                if size % self.tp:
+                    errors.append(f"TP={self.tp} must divide {name}={size}")
         if self.ep > 1:
             if not cfg.is_moe:
                 errors.append(f"EP={self.ep} requires a MoE model, but this model is dense")
-            elif cfg.num_experts % self.ep != 0:
-                errors.append(
-                    f"EP={self.ep} must divide num_experts={cfg.num_experts}"
-                )
+            elif cfg.num_experts % self.ep:
+                errors.append(f"EP={self.ep} must divide num_experts={cfg.num_experts}")
         if self.sp and self.tp == 1:
             errors.append("Sequence Parallel (SP) requires TP > 1")
-        if self.cp > 1 and self.tp == 1:
-            errors.append("Context Parallel (CP) typically requires TP > 1 for ring attention")
+        if include_warnings:
+            errors.extend(self.validation_warnings(cfg))
         return errors
 
-    @staticmethod
-    def _nearest_divisor(value: int, target: int) -> int:
-        for d in range(min(target, value), 0, -1):
-            if value % d == 0:
-                return d
-        return 1
-
-    def _skip_lm_head(self) -> bool:
-        """Whether LM head is tied and skipped."""
-        return False  # resolved by config_parser
+    def validation_warnings(self, cfg: ModelConfig) -> list[str]:
+        """Layouts that are usable but should be explained to the user."""
+        warnings = []
+        if isinstance(self.pp, int) and self.pp > 1 and cfg.num_hidden_layers % self.pp:
+            base = cfg.num_hidden_layers // self.pp
+            warnings.append(
+                f"PP={self.pp} distributes layers unevenly: "
+                f"{base} or {base + 1} layers per stage"
+            )
+        if self.cp > 1 and self.tp == 1:
+            warnings.append("CP without TP requires a backend that supports this layout")
+        return warnings
 
     def __str__(self) -> str:
         parts = []
@@ -122,7 +118,6 @@ def compute_sharding(
     kernel: KernelSpec,
     cfg: ModelConfig,
     pc: ParallelConfig,
-    pp_stage: int = -1,
 ) -> ShardedKernel:
     """Compute how a single kernel is sharded under the given parallel config."""
     orig_w = kernel.weight_shape
@@ -138,35 +133,23 @@ def compute_sharding(
     notes_parts = []
     shard_applied = []
 
-    # ── Pipeline Parallel: check if kernel is on this stage ──
+    # Assign global weights as well as decoder layers to pipeline stages.
     on_this = True
-    stage = -1
-    if pc.pp > 1 and kernel.layer_idx is not None:
-        layers_per_stage = cfg.num_hidden_layers // pc.pp
-        extra = cfg.num_hidden_layers % pc.pp
-        # Distribute extra layers to first stages
-        cumulative = 0
-        for s in range(pc.pp):
-            stage_layers = layers_per_stage + (1 if s < extra else 0)
-            if cumulative <= kernel.layer_idx < cumulative + stage_layers:
-                stage = s
-                break
-            cumulative += stage_layers
-        # For a specific stage, only that stage has the kernel
-        # We show ALL kernels but mark which stage they belong to
-        on_this = True  # we show all, mark stage
+    stage = pipeline_stage(kernel, cfg, pc)
+    if pc.pp > 1:
         notes_parts.append(f"PP stage {stage}/{pc.pp}")
-        shard_applied.append(f"PP: layer→stage {stage}")
+        shard_applied.append(f"PP: stage {stage}")
 
     # ── Tensor Parallel ──
     if pc.tp > 1:
         if kernel.shard_type == "column":
-            # Column parallel: split output dimension (dim=1)
-            if len(w) >= 2 and w[1] % pc.tp == 0:
-                w[1] = w[1] // pc.tp
-                if len(a) >= 1:
-                    a[-1] = a[-1] // pc.tp
-                shard_applied.append(f"TP: column split dim=1 → {w[1]}")
+            # Linear weights are [in, out]; their bias is [out].
+            dim = kernel.shard_dim
+            if w and w[dim] % pc.tp == 0:
+                w[dim] //= pc.tp
+                if a:
+                    a[-1] //= pc.tp
+                shard_applied.append(f"TP: column split dim={dim} → {w[dim]}")
                 comm_fwd = "none (fused with all-reduce via SP)" if pc.sp else comm_fwd
         elif kernel.shard_type == "row":
             # Row parallel: split input dimension (dim=0)
@@ -232,23 +215,18 @@ def compute_sharding(
             comm_fwd = "reduce-scatter (row→seq-sharded output)"
             notes_parts.append("SP: reduce-scatter output after row-parallel")
 
-    # ── Expert Parallel ──
-    if pc.ep > 1 and kernel.shard_type == "expert" and cfg.is_moe:
+    # Expert shapes describe one expert; memory includes all resident experts.
+    if kernel.shard_type == "expert" and cfg.is_moe:
         experts_per_gpu = cfg.num_experts // pc.ep
-        if "gate" in kernel.name or "up" in kernel.name:
-            notes_parts.append(f"EP: {experts_per_gpu} experts/GPU (col parallel within EP)")
-            if pc.tp > 1:
-                # Within EP, can also apply TP
-                if len(w) >= 2 and w[1] % pc.tp == 0:
-                    w[1] = w[1] // pc.tp
-                    shard_applied.append(f"TP within EP: col split → {w[1]}")
-        elif "down" in kernel.name:
-            notes_parts.append(f"EP: {experts_per_gpu} experts/GPU (row parallel within EP)")
-            if pc.tp > 1 and len(w) >= 2 and w[0] % pc.tp == 0:
-                w[0] = w[0] // pc.tp
-                shard_applied.append(f"TP within EP: row split → {w[0]}")
-        comm_fwd = "all-to-all (dispatch tokens→experts)" if pc.ep > 1 else comm_fwd
-        comm_bwd = "all-to-all (gather expert outputs)" if pc.ep > 1 else comm_bwd
+        notes_parts.append(f"{experts_per_gpu} experts/rank; shape is per expert")
+        if pc.ep > 1:
+            shard_applied.append(f"EP: {experts_per_gpu}/{cfg.num_experts} experts")
+            comm_fwd = "all-to-all (dispatch tokens→experts)"
+            comm_bwd = "all-to-all (gather expert outputs)"
+        if pc.tp > 1:
+            dim = kernel.shard_dim
+            w[dim] //= pc.tp
+            shard_applied.append(f"TP: expert dim={dim} → {w[dim]}")
 
     # ── Context Parallel (affects sequence dimension of activations) ──
     if pc.cp > 1:
@@ -266,13 +244,12 @@ def compute_sharding(
             notes_parts.append(f"DP: full replica on {pc.dp} groups")
             comm_bwd = "all_reduce (gradient sync)" if pc.dp > 1 else comm_bwd
 
-    # Compute memory
-    w_numel = 1
-    for d in w:
-        w_numel *= max(d, 1)
-    orig_numel = 1
-    for d in orig_w:
-        orig_numel *= max(d, 1)
+    # A weightless kernel contributes zero bytes, including under TP.
+    w_numel = prod(w)
+    orig_numel = prod(orig_w)
+    if kernel.shard_type == "expert" and cfg.is_moe:
+        w_numel *= cfg.num_experts // pc.ep
+        orig_numel *= cfg.num_experts
 
     return ShardedKernel(
         kernel=kernel,
@@ -291,27 +268,40 @@ def compute_sharding(
     )
 
 
+def pipeline_layer_ranges(num_layers: int, stages: int) -> list[tuple[int, int]]:
+    """Return inclusive-start, exclusive-end layer ranges for each stage."""
+    base, extra = divmod(num_layers, stages)
+    start = 0
+    ranges = []
+    for stage in range(stages):
+        end = start + base + (stage < extra)
+        ranges.append((start, end))
+        start = end
+    return ranges
+
+
+def pipeline_stage(kernel: KernelSpec, cfg: ModelConfig, pc: ParallelConfig) -> int:
+    if pc.pp == 1 or kernel.category == "embedding":
+        return 0
+    if kernel.layer_idx is None:
+        return pc.pp - 1
+    layer = kernel.layer_idx
+    if not 0 <= layer < cfg.num_hidden_layers:
+        raise ValueError(f"Layer {layer} is outside the model")
+    base, extra = divmod(cfg.num_hidden_layers, pc.pp)
+    larger_stages_end = (base + 1) * extra
+    if layer < larger_stages_end:
+        return layer // (base + 1)
+    return extra + (layer - larger_stages_end) // base
+
+
 def analyze_all_kernels(
     cfg: ModelConfig,
     pc: ParallelConfig,
     kernels: list[KernelSpec],
 ) -> list[ShardedKernel]:
-    """Compute sharding for all kernels."""
-    results = []
-    for k in kernels:
-        # Determine PP stage for this kernel
-        pp_stage = -1
-        if pc.pp > 1 and k.layer_idx is not None:
-            layers_per_stage = cfg.num_hidden_layers // pc.pp
-            extra = cfg.num_hidden_layers % pc.pp
-            cumulative = 0
-            for s in range(pc.pp):
-                stage_layers = layers_per_stage + (1 if s < extra else 0)
-                if cumulative <= k.layer_idx < cumulative + stage_layers:
-                    pp_stage = s
-                    break
-                cumulative += stage_layers
-
-        result = compute_sharding(k, cfg, pc, pp_stage=pp_stage)
-        results.append(result)
-    return results
+    """Compute sharding for all kernels after rejecting invalid dimensions."""
+    errors = pc.validate(cfg, include_warnings=False)
+    if errors:
+        raise ValueError("Invalid parallel configuration: " + "; ".join(errors))
+    return [compute_sharding(kernel, cfg, pc) for kernel in kernels]

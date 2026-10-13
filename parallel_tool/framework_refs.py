@@ -84,6 +84,18 @@ FRAMEWORK_REFS = {
 }
 
 
+def active_framework_refs(pc) -> list[tuple[str, dict]]:
+    """Select references once for both Rich and plain-text entry points."""
+    keys = []
+    if pc.tp > 1:
+        keys.extend(("TP_embedding", "TP_qkv", "TP_o_proj", "TP_mlp_gate_up", "TP_mlp_down", "TP_lm_head"))
+    for enabled, key in ((pc.pp > 1, "PP_layer_split"), (pc.cp > 1, "CP_ring_attention"),
+                         (pc.ep > 1, "EP_dispatch"), (pc.sp, "SP_regions"), (pc.dp > 1, "DP_grad_sync")):
+        if enabled:
+            keys.append(key)
+    return [(key, get_framework_ref(key)) for key in keys]
+
+
 def get_framework_ref(strategy: str) -> dict:
     """Get framework reference for a parallel strategy key."""
     return FRAMEWORK_REFS.get(strategy, {})

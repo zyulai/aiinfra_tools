@@ -126,6 +126,60 @@ python -m parallel_tool.main --config config.json --tp 4 --refs-only
 python -m parallel_tool.main --list-presets
 ```
 
+## Interactive Sharding Interface
+
+```bash
+python run.py --config test_config.json
+python run.py --config /path/to/model_directory
+# Same interactive session through the package entry point:
+python -m parallel_tool --config test_moe_config.json --interactive
+```
+
+The session keeps the current parallel configuration, precision, and view filters.
+Choose **4** to edit dimensions, **5** to select a preset within a GPU budget,
+and **6** to filter by category, layer, or pipeline stage and enable details.
+Choose **1** to analyze, **3** to compare presets, or **2** to generate weights.
+The single-GPU baseline is included in presets. GPU budget is a preset filter;
+weight estimates alone do not establish whether a model fits on a GPU.
+
+Tables adapt to terminal width; use `--width 80` to override it. Compact output
+shows weight shapes and split dimensions. Activation shapes, forward/backward
+communication, tensor names, and framework references are available on demand.
+JSON export always includes all kernels, regardless of display filters.
+
+```bash
+# Inspect one pipeline stage and attention layer with full details:
+python -m parallel_tool --config test_config.json --tp 4 --pp 2 \
+  --stage 0 --layer 0 --category attention --details --width 80
+
+# Include every layer and export the complete analysis:
+python -m parallel_tool --config test_config.json --tp 4 --all-layers --json results.json
+
+# Compare presets or explicit combinations:
+python -m parallel_tool --config test_config.json --compare 1gpu,tp4,tp4_pp2
+python -m parallel_tool --config test_config.json --compare 'tp=4,pp=2;tp=8'
+
+# Change estimate precision and append framework references:
+python -m parallel_tool --config test_config.json --tp 4 --dtype float32 --refs
+```
+
+**Memory scope:** weight bytes only, excluding activations, KV cache, gradients,
+and workspace. Pipeline summaries report each stage and the maximum weight size
+per GPU. Expert shapes describe one expert; byte totals include every expert
+resident on the rank. Linear analysis shapes use `[in, out]`, while HF checkpoint
+weights use `[out, in]`. The generator writes all PP layers for the selected
+TP/EP shard; its file size is therefore different from a single PP stage's memory.
+
+Generating a truncated model keeps the loaded model unchanged and writes the
+selected layer count into the generated configuration. The generation plan is
+shown after selecting precision and layers, before allocating tensors.
+
+Run regression checks with:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
 ## Supported Parallel Strategies
 
 | Strategy | Flag | What it shards | Comm Pattern |
@@ -158,11 +212,12 @@ The tool cross-references how each strategy is implemented in:
 ## Validation
 
 The tool checks divisibility constraints:
-- TP must divide num_attention_heads, num_key_value_heads, intermediate_size, vocab_size
-- PP divides layers (warns if uneven)
-- EP requires MoE model and divides num_experts
+- All parallel sizes must be positive integers; invalid configurations are rejected
+- TP must divide num_attention_heads, num_key_value_heads, vocab_size, and the FFN intermediate dimension (moe_intermediate_size for experts)
+- PP must not exceed the layer count; uneven stage sizes produce a warning
+- EP requires a MoE model and divides num_experts
 - SP requires TP > 1
-- CP typically requires TP > 1
+- CP without TP produces a backend-support warning
 
 ## Output Format
 

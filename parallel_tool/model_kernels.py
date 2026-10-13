@@ -2,7 +2,7 @@
 Define the kernel/module list for different transformer architectures.
 Each kernel has: name, weight shape, activation shape, shardable dimension.
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 from .config_parser import ModelConfig
 
@@ -187,7 +187,7 @@ def build_kernels(cfg: ModelConfig) -> list[KernelSpec]:
                 weight_shape=(h, moe_inter),
                 weight_name=f"{prefix}.{expert_pfx}.*.{gate_name}.weight",
                 shard_type="expert",
-                shard_dim=-1,
+                shard_dim=1,
                 activation_in_shape=(h,),
                 activation_out_shape=(moe_inter,),
                 comm_fwd="none",
@@ -202,7 +202,7 @@ def build_kernels(cfg: ModelConfig) -> list[KernelSpec]:
                 weight_shape=(h, moe_inter),
                 weight_name=f"{prefix}.{expert_pfx}.*.{up_name}.weight",
                 shard_type="expert",
-                shard_dim=-1,
+                shard_dim=1,
                 activation_in_shape=(h,),
                 activation_out_shape=(moe_inter,),
                 comm_fwd="none",
@@ -217,7 +217,7 @@ def build_kernels(cfg: ModelConfig) -> list[KernelSpec]:
                 weight_shape=(moe_inter, h),
                 weight_name=f"{prefix}.{expert_pfx}.*.{down_name}.weight",
                 shard_type="expert",
-                shard_dim=-1,
+                shard_dim=0,
                 activation_in_shape=(moe_inter,),
                 activation_out_shape=(h,),
                 comm_fwd="none (all-to-all if EP>1)",
@@ -283,6 +283,30 @@ def build_kernels(cfg: ModelConfig) -> list[KernelSpec]:
             comm_fwd="none",
             comm_bwd="none",
         ))
+
+    # Bias tensors use the output dimension and follow column-parallel weights.
+    bias_kernels = []
+    for kernel in kernels if cfg.attention_bias or cfg.mlp_bias else ():
+        has_bias = (
+            cfg.attention_bias and kernel.category == "attention"
+            and "core_attention" not in kernel.name
+        ) or (cfg.mlp_bias and kernel.category == "mlp")
+        if not has_bias:
+            continue
+        output_size = kernel.weight_shape[1]
+        is_column = kernel.shard_type in ("head", "column")
+        bias_kernels.append(KernelSpec(
+            name=f"{kernel.name}_bias",
+            category=kernel.category,
+            layer_idx=kernel.layer_idx,
+            weight_shape=(output_size,),
+            weight_name=kernel.weight_name.replace(".weight", ".bias"),
+            shard_type="column" if is_column else "replicated",
+            shard_dim=0 if is_column else -1,
+            activation_in_shape=(output_size,),
+            activation_out_shape=(output_size,),
+        ))
+    kernels.extend(bias_kernels)
 
     # ── Final norm ──
     kernels.append(KernelSpec(

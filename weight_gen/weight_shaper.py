@@ -2,8 +2,7 @@
 Weight shape mapping — generate the complete weight name → shape mapping
 for common HF transformer architectures, with optional parallel sharding.
 """
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
 from parallel_tool.config_parser import ModelConfig
 from parallel_tool.parallel_engine import ParallelConfig
 
@@ -39,7 +38,7 @@ def get_moe_naming(model_type: str) -> tuple:
     return _MOE_PATTERNS.get(model_type, _DEFAULT_MOE)
 
 
-def build_weight_map(cfg: ModelConfig, pc: ParallelConfig) -> list[WeightEntry]:
+def build_weight_map(cfg: ModelConfig, pc: ParallelConfig, dtype: str = "bfloat16") -> list[WeightEntry]:
     """
     Build the complete list of weight entries for a model.
     If TP > 1, shapes are pre-sharded for a single TP rank.
@@ -51,7 +50,6 @@ def build_weight_map(cfg: ModelConfig, pc: ParallelConfig) -> list[WeightEntry]:
     inter = cfg.intermediate_size
     vocab = cfg.vocab_size
     tp = pc.tp
-    sp = pc.sp
 
     entries: list[WeightEntry] = []
 
@@ -228,6 +226,8 @@ def build_weight_map(cfg: ModelConfig, pc: ParallelConfig) -> list[WeightEntry]:
             shard_type="vocab_col" if tp > 1 else "none",
         ))
 
+    for entry in entries:
+        entry.dtype = dtype
     return entries
 
 

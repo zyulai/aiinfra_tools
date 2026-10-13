@@ -1,590 +1,379 @@
 #!/usr/bin/env python3
-"""
-Unified interactive runner — auto-detect valid parallel strategies from config,
-present a beautiful menu, let user pick by number.
-
-Usage:
-  python run.py --config config.json
-  python run.py --config /path/to/model_dir
-  python run.py --model /mnt/hdd/models/Qwen3.6-27B-DFlash-MS
-"""
+"""Interactive model sharding analysis with an editable current configuration."""
 import argparse
-import os
-import sys
 import json
-import math
+import os
+from dataclasses import replace
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
+from rich import box
 from rich.console import Console
 from rich.panel import Panel
+from rich.prompt import Confirm, IntPrompt, Prompt
 from rich.table import Table
-from rich.prompt import IntPrompt, Confirm, Prompt
 from rich.text import Text
-from rich.columns import Columns
-from rich import box
-from rich.align import Align
-from rich.rule import Rule
 
-from parallel_tool.config_parser import parse_config, ModelConfig
-from parallel_tool.model_kernels import build_kernels
-from parallel_tool.parallel_engine import ParallelConfig, analyze_all_kernels
-from parallel_tool.table_renderer import render_table, RICH_AVAILABLE
-from parallel_tool.framework_refs import FRAMEWORK_REFS
-from parallel_tool.main import compare_strategies
+from parallel_tool.config_parser import ModelConfig, parse_config
+from parallel_tool.parallel_engine import ParallelConfig
+from parallel_tool.reporting import (
+    CATEGORY_NAMES, DTYPE_BYTES, analysis_as_dict, analyze_model, format_bytes, summarize_memory,
+)
+from parallel_tool.table_renderer import print_analysis, print_comparison
+from parallel_tool.framework_refs import active_framework_refs
 
-console = Console(width=120)
-
-# ── Colors ──
-C_TITLE = "bold bright_cyan"
-C_OK = "bold green"
-C_NO = "bold red"
-C_DIM = "dim"
-C_KEY = "bold yellow"
-C_VAL = "white"
-C_HEAD = "bold bright_magenta"
-
-
-def fmt_bytes(n: int) -> str:
-    val = float(n)
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if abs(val) < 1024:
-            return f"{val:.1f} {unit}"
-        val /= 1024
-    return f"{val:.1f} PB"
+console = Console()
+fmt_bytes = format_bytes
 
 
 def detect_strategies(cfg: ModelConfig) -> dict:
-    """Auto-detect valid parallel strategies from model config."""
-    result = {"tp": [], "pp": [], "cp": [], "ep": [], "sp": False, "moe": cfg.is_moe}
-
-    # ── TP: check divisibility of all critical dims ──
-    dims = [d for d in [cfg.num_attention_heads, cfg.kv_heads,
-                        cfg.intermediate_size, cfg.vocab_size] if d > 0]
-    for tp in [1, 2, 4, 8, 16, 32, 64]:
-        if all(d % tp == 0 for d in dims):
-            result["tp"].append(tp)
-
-    # ── PP: split layers ──
-    for pp in [1, 2, 3, 4, 8, 16]:
-        if pp <= cfg.num_hidden_layers:
-            result["pp"].append(pp)
-
-    # ── CP: typically powers of 2 ──
-    result["cp"] = [1, 2, 4, 8]
-
-    # ── EP: only for MoE ──
-    if cfg.is_moe and cfg.num_experts > 0:
-        for ep in [1, 2, 4, 8, 16, 32, 60]:
-            if cfg.num_experts % ep == 0:
-                result["ep"].append(ep)
-
-    # ── SP: requires TP > 1 ──
-    result["sp"] = len(result["tp"]) > 1  # at least TP=1 and TP=2
-
-    return result
+    tps = [size for size in range(1, min(cfg.num_attention_heads, 64) + 1)
+           if not ParallelConfig(tp=size).validate(cfg, include_warnings=False)]
+    pps = sorted({size for size in (1, 2, 3, 4, 8, 16, cfg.num_hidden_layers)
+                  if not ParallelConfig(pp=size).validate(cfg, include_warnings=False)})
+    eps = ([size for size in range(1, min(cfg.num_experts, 64) + 1)
+            if not ParallelConfig(ep=size).validate(cfg, include_warnings=False)]
+           if cfg.is_moe else [])
+    if cfg.is_moe and cfg.num_experts not in eps:
+        eps.append(cfg.num_experts)
+    return {"tp": tps, "pp": pps, "cp": [1, 2, 4, 8], "ep": eps,
+            "sp": any(size > 1 for size in tps), "moe": cfg.is_moe}
 
 
-def estimate_weight_size(cfg: ModelConfig, tp: int = 1, pp: int = 1, ep: int = 1, num_layers: int = None) -> int:
-    """Estimate total weight bytes for a model (bf16) per GPU."""
-    h = cfg.hidden_size
-    hd = cfg.effective_head_dim
-    n_heads = cfg.num_attention_heads
-    n_kv = cfg.kv_heads
-    inter = cfg.intermediate_size
-    vocab = cfg.vocab_size
-    layers = (num_layers or cfg.num_hidden_layers) // max(pp, 1)
-    bytes_per = 2  # bf16
-
-    total = 0
-    # Embedding (only on stage 0 for PP)
-    embed_bytes = (vocab // tp) * h * bytes_per
-    if pp > 1:
-        embed_bytes = embed_bytes  # still on first stage, but we show average
-    total += embed_bytes
-
-    # Per layer
-    q = (n_heads // tp) * hd * h
-    k = (n_kv // tp) * hd * h
-    v = (n_kv // tp) * hd * h
-    o = h * (n_heads // tp) * hd
-    gate = (inter // tp) * h
-    up = (inter // tp) * h
-    down = h * (inter // tp)
-    norms = h * 2  # input + post_attn
-    layer_total = q + k + v + o + gate + up + down + norms
-
-    if cfg.is_moe and ep > 1:
-        # Experts are split by EP, not by the layer weight
-        moe_inter = cfg.moe_intermediate_size or inter
-        experts_per_rank = cfg.num_experts // ep
-        per_expert = (moe_inter // tp * h + moe_inter // tp * h + h * moe_inter // tp) * bytes_per
-        layer_total = (q + k + v + o + norms) * bytes_per  # non-expert per layer
-        layer_total += per_expert * experts_per_rank  # expert weights per rank
-    else:
-        layer_total = layer_total * bytes_per
-
-    total += layer_total * layers
-    # Final norm + LM head (only on last stage for PP)
-    total += h * bytes_per
-    if not cfg.tie_word_embeddings:
-        total += (vocab // tp) * h * bytes_per
-
-    return total
+def estimate_weight_size(cfg, tp=1, pp=1, ep=1, num_layers=None, dtype="bfloat16", *, cache=None) -> int:
+    # The optional cache belongs to one model session and stores only byte counts.
+    key = (tp, pp, ep, num_layers, dtype)
+    if cache is not None and key in cache:
+        return cache[key]
+    actual_cfg = replace(cfg, num_hidden_layers=num_layers) if num_layers is not None else cfg
+    pc = ParallelConfig(tp=tp, pp=pp, ep=ep)
+    size = summarize_memory(actual_cfg, pc, analyze_model(actual_cfg, pc, dtype)).peak_weight_bytes
+    if cache is not None:
+        cache[key] = size
+    return size
 
 
-def show_model_summary(cfg: ModelConfig):
-    """Show model info in a beautiful panel."""
-    size_full = estimate_weight_size(cfg, tp=1, pp=1)
-
-    info = Table(show_header=False, box=None, padding=(0, 1))
-    info.add_column("key", style=C_KEY, width=20)
-    info.add_column("val", style=C_VAL)
-
-    info.add_row("Model Type", cfg.model_type)
-    info.add_row("Architecture", ", ".join(cfg.architectures) or "—")
-    info.add_row("Hidden Size", str(cfg.hidden_size))
-    info.add_row("Layers", str(cfg.num_hidden_layers))
-    info.add_row("Attention Heads", str(cfg.num_attention_heads))
-    info.add_row("KV Heads", f"{cfg.kv_heads} (GQA ratio = {cfg.num_attention_heads // cfg.kv_heads}:1)")
-    info.add_row("Head Dim", str(cfg.effective_head_dim))
-    info.add_row("Intermediate", str(cfg.intermediate_size))
-    info.add_row("Vocab Size", str(cfg.vocab_size))
-    if cfg.is_moe:
-        info.add_row("MoE", f"[{C_OK}]Yes[/]  {cfg.num_experts} experts, {cfg.num_experts_per_tok}/tok")
-        info.add_row("MoE Inter", str(cfg.moe_intermediate_size or cfg.intermediate_size))
-    else:
-        info.add_row("MoE", f"[{C_NO}]No[/]  (dense model)")
-    info.add_row("Tied Embeddings", str(cfg.tie_word_embeddings))
-    info.add_row("Weight Size (bf16)", fmt_bytes(size_full))
-
-    console.print(Panel(info, title="[bold bright_cyan]Model Summary[/]",
-                        border_style="bright_blue", width=60))
+def show_model_summary(cfg: ModelConfig, dtype="bfloat16", *, cache=None):
+    table = Table.grid(padding=(0, 2))
+    table.add_column(style="bold cyan")
+    table.add_column(overflow="fold")
+    rows = [
+        ("Model", cfg.model_type), ("Architecture", ", ".join(cfg.architectures) or "—"),
+        ("Layers / hidden", f"{cfg.num_hidden_layers} / {cfg.hidden_size}"),
+        ("Q / KV heads", f"{cfg.num_attention_heads} / {cfg.kv_heads}"),
+        ("Head dimension", str(cfg.effective_head_dim)),
+        ("FFN / vocabulary", f"{cfg.intermediate_size} / {cfg.vocab_size}"),
+        ("Experts", f"{cfg.num_experts} ({cfg.num_experts_per_tok} active/token)" if cfg.is_moe else "Dense model"),
+        (f"Weights ({dtype})", format_bytes(estimate_weight_size(cfg, dtype=dtype, cache=cache))),
+    ]
+    for key, value in rows:
+        table.add_row(key, Text(value))
+    console.print(Panel(table, title="Model", border_style="blue"))
 
 
-def show_strategy_menu(cfg: ModelConfig, strategies: dict):
-    """Show valid parallel strategies in a nice table."""
-    table = Table(title="[bold]Auto-Detected Parallel Strategies[/]",
-                  box=box.ROUNDED, show_lines=True, width=110)
-    table.add_column("Strategy", style=C_HEAD, width=16)
-    table.add_column("Valid Sizes", width=50)
-    table.add_column("Constraint", style=C_DIM, width=40)
-
-    # TP
-    tp_strs = []
-    for tp in strategies["tp"]:
-        if tp == 1:
-            tp_strs.append(f"[dim]TP=1[/]")
-        else:
-            sz = estimate_weight_size(cfg, tp=tp, pp=1)
-            tp_strs.append(f"[green]TP={tp}[/]  ({fmt_bytes(sz)}/GPU)")
-    table.add_row("Tensor Parallel", "\n".join(tp_strs),
-                  f"must divide heads({cfg.num_attention_heads}), KV({cfg.kv_heads}), "
-                  f"inter({cfg.intermediate_size}), vocab({cfg.vocab_size})")
-
-    # PP
-    pp_strs = []
-    for pp in strategies["pp"]:
-        if pp == 1:
-            pp_strs.append("[dim]PP=1  (no pipeline)[/]")
-        else:
-            base = cfg.num_hidden_layers // pp
-            extra = cfg.num_hidden_layers % pp
-            if extra:
-                dist = ", ".join(str(base+1 if i < extra else base) for i in range(pp))
-                pp_strs.append(f"[green]PP={pp}[/]  layers=[{dist}]")
-            else:
-                pp_strs.append(f"[green]PP={pp}[/]  {base} layers/stage")
-    table.add_row("Pipeline Parallel", "\n".join(pp_strs),
-                  f"must be ≤ num_layers({cfg.num_hidden_layers})")
-
-    # CP
-    cp_strs = []
-    for cp in strategies["cp"]:
-        if cp == 1:
-            cp_strs.append("[dim]CP=1  (no context parallel)[/]")
-        else:
-            cp_strs.append(f"[green]CP={cp}[/]")
-    table.add_row("Context Parallel", "\n".join(cp_strs), "splits seq_len (needs TP>1)")
-
-    # EP
-    if cfg.is_moe:
-        ep_strs = []
-        for ep in strategies["ep"]:
-            if ep == 1:
-                ep_strs.append("[dim]EP=1  (no expert parallel)[/]")
-            else:
-                ep_strs.append(f"[green]EP={ep}[/]  {cfg.num_experts // ep} experts/rank")
-        table.add_row("Expert Parallel", "\n".join(ep_strs),
-                      f"must divide num_experts({cfg.num_experts})")
-    else:
-        table.add_row("Expert Parallel", "[dim]N/A — dense model[/]", "requires MoE architecture")
-
-    # SP
-    if strategies["sp"]:
-        table.add_row("Sequence Parallel", "[green]SP = on/off[/]", "requires TP > 1")
-    else:
-        table.add_row("Sequence Parallel", "[dim]N/A — TP must be > 1[/]", "requires TP > 1")
-
+def show_strategy_menu(cfg, strategies):
+    table = Table(title="Available parallel dimensions", box=box.ROUNDED, expand=True)
+    table.add_column("Dimension", style="bold cyan")
+    table.add_column("Sizes", overflow="fold")
+    table.add_column("Effect", overflow="fold")
+    for key, description in (("tp", "Split heads, FFN and vocabulary"),
+                             ("pp", "Assign layers to pipeline stages"),
+                             ("cp", "Split sequence; backend-dependent"),
+                             ("ep", "Distribute MoE experts")):
+        table.add_row(key.upper(), ", ".join(map(str, strategies[key])) or "Unavailable", description)
+    table.add_row("DP", "Any positive integer", "Replicate the model")
+    table.add_row("SP", "On / off" if strategies["sp"] else "Unavailable", "Sequence sharding with TP > 1")
     console.print(table)
 
 
-def generate_presets(cfg: ModelConfig, strategies: dict) -> list[dict]:
-    """Auto-generate valid preset combinations from detected strategies."""
+def generate_presets(cfg, strategies, gpu_budget=None) -> list[ParallelConfig]:
     presets = []
-    tps = [t for t in strategies["tp"] if t > 1]  # exclude TP=1
-    pps = [p for p in strategies["pp"] if p > 1]
-    eps = [e for e in strategies["ep"] if e > 1]
+    seen = set()
 
-    # Single TP
-    for tp in tps[:4]:  # limit to first 4
-        pc = ParallelConfig(tp=tp, sp=True)
-        presets.append({"config": pc, "desc": f"TP={tp} + SP", "gpus": tp})
+    def add(pc):
+        key = (pc.tp, pc.pp, pc.cp, pc.ep, pc.dp, pc.sp)
+        if key in seen or pc.validate(cfg, include_warnings=False):
+            return
+        if gpu_budget is not None and pc.world_size > gpu_budget:
+            return
+        seen.add(key)
+        presets.append(pc)
 
-    # TP + PP combinations (pick reasonable ones)
+    add(ParallelConfig())
+    tps = [size for size in strategies["tp"] if size > 1]
+    pps = [size for size in strategies["pp"] if size > 1]
+    for tp in tps[:3]:
+        add(ParallelConfig(tp=tp, sp=True))
+    for pp in pps[:2]:
+        add(ParallelConfig(pp=pp))
     for tp in tps[:2]:
         for pp in pps[:2]:
-            pc = ParallelConfig(tp=tp, pp=pp, sp=True)
-            presets.append({"config": pc, "desc": f"TP={tp} + PP={pp} + SP", "gpus": tp * pp})
-
-    # TP + CP
+            add(ParallelConfig(tp=tp, pp=pp, sp=True))
     for tp in tps[:2]:
-        pc = ParallelConfig(tp=tp, cp=2, sp=True)
-        presets.append({"config": pc, "desc": f"TP={tp} + CP=2 + SP", "gpus": tp * 2})
-
-    # EP combos for MoE
-    if eps:
-        for ep in eps[:3]:  # limit to first 3 reasonable values
-            tp = 2 if 2 in strategies["tp"] else 1
-            pc = ParallelConfig(tp=tp, ep=ep)
-            presets.append({"config": pc, "desc": f"TP={tp} + EP={ep}", "gpus": tp * ep})
-
-    # Full 3D
+        add(ParallelConfig(tp=tp, cp=2, sp=True))
+    for ep in [size for size in strategies["ep"] if size > 1][:3]:
+        add(ParallelConfig(tp=tps[0] if tps else 1, ep=ep))
     if tps and pps:
-        tp = tps[0]
-        pp = pps[0]
-        pc = ParallelConfig(tp=tp, pp=pp, dp=2, sp=True)
-        presets.append({"config": pc, "desc": f"TP={tp} + PP={pp} + DP=2 + SP", "gpus": tp * pp * 2})
-
-    # Dedupe by description
-    seen = set()
-    unique = []
-    for p in presets:
-        if p["desc"] not in seen:
-            seen.add(p["desc"])
-            unique.append(p)
-
-    return unique
+        add(ParallelConfig(tp=tps[0], pp=pps[0], dp=2, sp=True))
+    return presets
 
 
-def show_preset_menu(cfg: ModelConfig, presets: list[dict]):
-    """Show preset options as a numbered table."""
-    table = Table(title="[bold]Preset Parallel Configurations[/]",
-                  box=box.ROUNDED, show_lines=True, width=100)
-    table.add_column("#", style=C_HEAD, justify="center", width=4)
-    table.add_column("Configuration", style="bold", width=35)
-    table.add_column("GPUs", justify="center", width=6)
-    table.add_column("Weight/GPU", justify="right", width=14)
-
-    for i, p in enumerate(presets, 1):
-        pc = p["config"]
-        sz = estimate_weight_size(cfg, tp=pc.tp, pp=pc.pp, ep=pc.ep)
-        if pc.ep > 1 and cfg.is_moe:
-            sz_str = f"{fmt_bytes(sz)} + {cfg.num_experts // pc.ep} exp"
-        else:
-            sz_str = fmt_bytes(sz)
-        table.add_row(str(i), p["desc"], str(p["gpus"]), sz_str)
-
+def show_preset_menu(cfg, presets, dtype="bfloat16", *, cache=None):
+    table = Table(title="Preset configurations", box=box.ROUNDED, expand=True)
+    table.add_column("#", justify="right", width=3)
+    table.add_column("Configuration", ratio=3, overflow="fold")
+    table.add_column("GPUs", justify="right", width=5)
+    table.add_column("Peak weight/GPU", justify="right", ratio=2)
+    for index, pc in enumerate(presets, 1):
+        memory = estimate_weight_size(cfg, tp=pc.tp, pp=pc.pp, ep=pc.ep, dtype=dtype, cache=cache)
+        table.add_row(str(index), Text(str(pc)), str(pc.world_size), format_bytes(memory))
     console.print(table)
+    console.print("[dim]Weight estimates exclude activations, KV cache and workspace.[/dim]")
 
 
 def show_action_menu():
-    """Show action selection."""
-    console.print()
-    actions = Table(box=box.ROUNDED, width=70, show_lines=True)
-    actions.add_column("#", style=C_HEAD, justify="center", width=4)
-    actions.add_column("Action", style="bold", width=50)
-    actions.add_row("1", "🔍  Analyze kernel sharding (parallel_tool)")
-    actions.add_row("2", "⚡  Generate random weights (weight_gen)")
-    actions.add_row("3", "📊  Compare multiple strategies side-by-side")
-    actions.add_row("4", "🔧  Custom config (pick each dimension)")
-    actions.add_row("0", "🚪  Exit")
-    console.print(Panel(actions, title="[bold]Choose Action[/]", border_style="bright_yellow"))
-
-
-def custom_config_flow(cfg: ModelConfig, strategies: dict) -> ParallelConfig:
-    """Let user pick each dimension interactively."""
-    pc = ParallelConfig()
-
-    # TP
-    console.print(f"\n[{C_KEY}]Tensor Parallel[/] — valid: {strategies['tp']}")
-    tp = IntPrompt.ask(f"  TP size", default=1, choices=[str(t) for t in strategies["tp"]])
-    pc.tp = tp
-
-    # PP
-    console.print(f"\n[{C_KEY}]Pipeline Parallel[/] — valid: {strategies['pp']}")
-    pp = IntPrompt.ask(f"  PP size", default=1, choices=[str(p) for p in strategies["pp"]])
-    pc.pp = pp
-
-    # CP (only if TP > 1)
-    if tp > 1:
-        console.print(f"\n[{C_KEY}]Context Parallel[/] — valid: {strategies['cp']}")
-        cp = IntPrompt.ask(f"  CP size", default=1, choices=[str(c) for c in strategies["cp"]])
-        pc.cp = cp
-
-    # EP (only for MoE)
-    if cfg.is_moe and strategies["ep"]:
-        console.print(f"\n[{C_KEY}]Expert Parallel[/] — valid: {strategies['ep']}")
-        ep = IntPrompt.ask(f"  EP size", default=1, choices=[str(e) for e in strategies["ep"]])
-        pc.ep = ep
-
-    # SP (only if TP > 1)
-    if tp > 1:
-        pc.sp = Confirm.ask(f"\n  Enable Sequence Parallel (SP)?", default=True)
-
-    # DP
-    dp = IntPrompt.ask(f"\n  Data Parallel size", default=1)
-    pc.dp = max(dp, 1)
-
-    return pc
-
-
-def run_analysis(cfg: ModelConfig, pc: ParallelConfig):
-    """Run parallel analysis and show results."""
-    kernels = build_kernels(cfg)
-    errors = pc.validate(cfg)
-    if errors:
-        console.print(f"\n[bold red]⚠ Validation:[/]")
-        for e in errors:
-            console.print(f"  [red]- {e}[/]")
-
-    results = analyze_all_kernels(cfg, pc, kernels)
-    table = render_table(cfg, pc, results, use_rich=True)
-    console.print(table)
-
-    # Framework refs
-    console.print()
-    console.print(Rule("[bold]Framework Implementation References[/]", style="bright_blue"))
-    show_framework_refs(pc)
-
-    # Offer JSON export
-    if Confirm.ask("\n  Export to JSON?", default=False):
-        path = Prompt.ask("  Output path", default="parallel_result.json")
-        data = {
-            "model": {"model_type": cfg.model_type, "hidden_size": cfg.hidden_size,
-                      "num_hidden_layers": cfg.num_hidden_layers},
-            "parallel_config": {"tp": pc.tp, "pp": pc.pp, "cp": pc.cp, "ep": pc.ep,
-                                "dp": pc.dp, "sp": pc.sp, "world_size": pc.world_size},
-            "kernels": [{"name": r.kernel.name, "category": r.kernel.category,
-                         "original_weight_shape": list(r.original_weight_shape),
-                         "sharded_weight_shape": list(r.sharded_weight_shape),
-                         "comm_fwd": r.comm_fwd, "comm_bwd": r.comm_bwd,
-                         "memory_per_gpu_bytes": r.memory_per_gpu_bytes}
-                        for r in results],
-        }
-        with open(path, "w") as f:
-            json.dump(data, f, indent=2)
-        console.print(f"  [{C_OK}]✓ Saved to {path}[/]")
-
-
-def show_framework_refs(pc: ParallelConfig):
-    """Show framework references for active strategies."""
-    refs_to_show = []
-    if pc.tp > 1:
-        refs_to_show.extend(["TP_embedding", "TP_qkv", "TP_o_proj", "TP_mlp_gate_up",
-                             "TP_mlp_down", "TP_lm_head"])
-    if pc.pp > 1:
-        refs_to_show.append("PP_layer_split")
-    if pc.cp > 1:
-        refs_to_show.append("CP_ring_attention")
-    if pc.ep > 1:
-        refs_to_show.append("EP_dispatch")
-    if pc.sp:
-        refs_to_show.append("SP_regions")
-    if pc.dp > 1:
-        refs_to_show.append("DP_grad_sync")
-
-    for key in refs_to_show:
-        ref = FRAMEWORK_REFS.get(key, {})
-        console.print(f"\n  [bold cyan]┌─ {key}[/]")
-        console.print(f"  [{C_DIM}]├─ Pattern:[/] {ref.get('pattern', 'N/A')}")
-        console.print(f"  [{C_DIM}]├─ SGLang:  [/] {ref.get('sglang', 'N/A')}")
-        console.print(f"  [{C_DIM}]├─ vLLM:    [/] {ref.get('vllm', 'N/A')}")
-        console.print(f"  [{C_DIM}]└─ Megatron:[/] {ref.get('megatron', 'N/A')}")
-
-
-def run_weight_gen(cfg: ModelConfig, pc: ParallelConfig):
-    """Run weight generation."""
-    from weight_gen.weight_shaper import build_weight_map, compute_total_bytes
-    from weight_gen.weight_writer import generate_random_weights, save_single_file, write_index_json
-    from weight_gen.model_cloner import clone_aux_files, write_config
-
-    entries = build_weight_map(cfg, pc)
-    total = compute_total_bytes(entries)
-
-    # Show plan
-    plan = Table(box=box.ROUNDED, width=60, show_lines=True)
-    plan.add_column("Item", style=C_KEY, width=20)
-    plan.add_column("Value", style=C_VAL, width=35)
-    plan.add_row("Total weights", f"{len(entries)} tensors")
-    plan.add_row("Total size", fmt_bytes(total))
-    plan.add_row("Dtype", "bfloat16")
-    console.print(Panel(plan, title="[bold]Weight Generation Plan[/]", border_style="bright_green"))
-
-    # Ask for options
-    output_dir = Prompt.ask("\n  Output directory", default="./rand_model")
-    num_layers = None
-    if cfg.num_hidden_layers > 8:
-        if Confirm.ask(f"  Truncate layers? (model has {cfg.num_hidden_layers} layers)", default=True):
-            num_layers = IntPrompt.ask("  Num layers", default=min(4, cfg.num_hidden_layers))
-    
-    dtype = Prompt.ask("  Dtype", choices=["bfloat16", "float16", "float32"], default="bfloat16")
-    init = Prompt.ask("  Init strategy", choices=["normal", "uniform", "zeros", "small"], default="normal")
-    gen_benchmark = Confirm.ask("  Generate benchmark script?", default=True)
-    bench_backend = "vllm"
-    if gen_benchmark:
-        bench_backend = Prompt.ask("  Benchmark backend", choices=["vllm", "sglang", "hf"], default="vllm")
-
-    source_dir = Prompt.ask("  Tokenizer source dir (empty = skip)", default="")
-
-    # Generate
-    console.print(f"\n  [{C_OK}]Generating...[/]")
-    
-    overrides = {}
-    actual_cfg = cfg
-    if num_layers and num_layers != cfg.num_hidden_layers:
-        overrides["num_hidden_layers"] = num_layers
-        cfg.num_hidden_layers = num_layers
-        actual_cfg = cfg
-
-    from weight_gen.main import generate_model
-    generate_model(
-        cfg=actual_cfg, pc=pc, output_dir=output_dir,
-        source_dir=source_dir if source_dir else None,
-        num_layers=num_layers,
-        dtype=dtype, init_strategy=init,
-        benchmark=bench_backend if gen_benchmark else None,
-        verbose=True,
+    console.print(
+        "[bold]1[/] Analyze   [bold]2[/] Generate weights   [bold]3[/] Compare\n"
+        "[bold]4[/] Edit config   [bold]5[/] Presets / GPU budget   [bold]6[/] View options\n"
+        "[bold]7[/] Available dimensions   [bold]0[/] Exit"
     )
 
 
-def run_compare(cfg: ModelConfig, strategies: dict):
-    """Compare multiple strategies."""
-    presets = generate_presets(cfg, strategies)
-    console.print("\n[bold]Select strategies to compare (comma-separated numbers):[/]")
-    show_preset_menu(cfg, presets)
-    sel = Prompt.ask("\n  Select (e.g. 1,3,5)")
-    indices = []
-    for s in sel.split(","):
-        s = s.strip()
-        if s.isdigit():
-            idx = int(s) - 1
-            if 0 <= idx < len(presets):
-                indices.append(idx)
-    
-    if not indices:
-        console.print("  [red]No valid selection[/]")
+def _positive_int(label, default=1, maximum=None):
+    while True:
+        value = IntPrompt.ask(label, default=default)
+        if value >= 1 and (maximum is None or value <= maximum):
+            return value
+        console.print(f"[red]Enter a value between 1 and {maximum}.[/red]" if maximum else
+                      "[red]Enter a positive integer.[/red]")
+
+
+def _show_validation(cfg, pc):
+    errors = pc.validate(cfg, include_warnings=False)
+    for error in errors:
+        console.print(Text(error, style="red"))
+    for warning in pc.validation_warnings(cfg):
+        console.print(Text(warning, style="yellow"))
+    return not errors
+
+
+def custom_config_flow(cfg, strategies, current=None, gpu_budget=None):
+    pc = replace(current) if current is not None else ParallelConfig()
+    for key in ("tp", "pp", "cp", "ep"):
+        if key == "cp" and pc.tp == 1:
+            pc.cp = 1
+            continue
+        if key == "ep" and not cfg.is_moe:
+            pc.ep = 1
+            continue
+        choices = strategies[key]
+        default = getattr(pc, key) if getattr(pc, key) in choices else 1
+        console.print(Text(f"{key.upper()} sizes: {', '.join(map(str, choices))}", style="dim"))
+        setattr(pc, key, IntPrompt.ask(key.upper(), default=default, choices=[str(size) for size in choices]))
+    pc.sp = Confirm.ask("Enable sequence parallel?", default=pc.sp) if pc.tp > 1 else False
+    pc.dp = _positive_int("DP replicas", default=pc.dp)
+    if not _show_validation(cfg, pc):
+        return None
+    if gpu_budget is not None and pc.world_size > gpu_budget:
+        console.print(f"[red]This configuration needs {pc.world_size} GPUs; budget is {gpu_budget}.[/red]")
+        return None
+    return pc
+
+
+def run_analysis(cfg, pc, *, dtype="bfloat16", view=None):
+    if not _show_validation(cfg, pc):
         return
-    
-    strategies_list = [presets[i]["config"] for i in indices]
-    console.print(compare_strategies(cfg, strategies_list))
+    results = analyze_model(cfg, pc, dtype)
+    console.print(Text(f"Weight precision: {dtype}", style="dim"))
+    print_analysis(cfg, pc, results, console=console, **(view or {}))
+    if Confirm.ask("Show framework references?", default=False):
+        show_framework_refs(pc)
+    if Confirm.ask("Export complete analysis to JSON?", default=False):
+        path = os.path.expanduser(Prompt.ask("Output path", default="parallel_result.json"))
+        with open(path, "w") as handle:
+            json.dump(analysis_as_dict(cfg, pc, results, dtype), handle, indent=2)
+        console.print(Text(f"Saved all {len(results)} kernels to {path}", style="green"))
+
+
+def show_framework_refs(pc):
+    references = active_framework_refs(pc)
+    if not references:
+        console.print("[dim]No distributed strategies are enabled.[/dim]")
+    for key, reference in references:
+        text = "\n".join(f"{name}: {reference.get(name, 'N/A')}"
+                         for name in ("pattern", "sglang", "vllm", "megatron"))
+        console.print(Panel(Text(text), title=key, border_style="blue"))
+
+
+def run_weight_gen(cfg, pc, *, dtype="bfloat16", source_dir=None):
+    from weight_gen.main import generate_model
+    from weight_gen.weight_shaper import build_weight_map, compute_total_bytes
+
+    output_dir = os.path.expanduser(Prompt.ask("Output directory", default="./rand_model"))
+    num_layers = cfg.num_hidden_layers
+    if Confirm.ask(f"Truncate the {cfg.num_hidden_layers}-layer model?", default=False):
+        num_layers = _positive_int("Layers to generate", default=min(4, cfg.num_hidden_layers),
+                                   maximum=cfg.num_hidden_layers)
+    dtype = Prompt.ask("Weight precision", choices=list(DTYPE_BYTES), default=dtype)
+    init = Prompt.ask("Initialization", choices=["normal", "uniform", "zeros", "small"], default="normal")
+    all_ranks = Confirm.ask("Generate all TP ranks in separate directories?", default=False)
+    benchmark = None
+    if Confirm.ask("Generate a benchmark script?", default=False):
+        benchmark = Prompt.ask("Backend", choices=["vllm", "sglang", "hf"], default="vllm")
+    source_dir = os.path.expanduser(Prompt.ask("Tokenizer source directory (empty to skip)", default=source_dir or ""))
+    actual_cfg = replace(cfg, num_hidden_layers=num_layers)
+    if not _show_validation(actual_cfg, pc):
+        return None
+    entries = build_weight_map(actual_cfg, pc, dtype=dtype)
+    total_bytes = compute_total_bytes(entries)
+    plan = Table.grid(padding=(0, 2))
+    plan.add_column(style="bold cyan")
+    plan.add_column(overflow="fold")
+    for key, value in (
+        ("Output", output_dir), ("Layers", f"{num_layers} / {cfg.num_hidden_layers}"),
+        ("Precision / init", f"{dtype} / {init}"), ("Tensors per TP rank", str(len(entries))),
+        ("Weights per TP rank", format_bytes(total_bytes)),
+        ("Total files' weight size", format_bytes(total_bytes * (pc.tp if all_ranks else 1))),
+        ("Checkpoint scope", "All PP stages; selected TP/EP shard"),
+    ):
+        plan.add_row(key, Text(value))
+    console.print(Panel(plan, title="Weight generation plan", border_style="green"))
+    if os.path.isdir(output_dir):
+        with os.scandir(output_dir) as files:
+            nonempty = next(files, None) is not None
+        if nonempty and not Confirm.ask("Output directory is not empty. Replace generated files?", default=False):
+            return None
+    if not Confirm.ask("Generate these weights?", default=False):
+        return None
+    generate_model(cfg=cfg, pc=pc, output_dir=output_dir, source_dir=source_dir or None,
+                   num_layers=num_layers, dtype=dtype, init_strategy=init,
+                   all_ranks=all_ranks, benchmark=benchmark, verbose=True)
+    return dtype
+
+
+def run_compare(cfg, strategies, *, gpu_budget=None, dtype="bfloat16", cache=None):
+    presets = generate_presets(cfg, strategies, gpu_budget)
+    if len(presets) < 2:
+        console.print("[yellow]Only one preset fits this GPU budget.[/yellow]")
+        return
+    show_preset_menu(cfg, presets, dtype, cache=cache)
+    while True:
+        selection = Prompt.ask("Compare preset numbers (comma-separated, 0 to cancel)", default="1,2")
+        if selection.strip() == "0":
+            return
+        try:
+            indices = list(dict.fromkeys(int(value.strip()) - 1 for value in selection.split(",")))
+        except ValueError:
+            indices = []
+        if len(indices) >= 2 and all(0 <= index < len(presets) for index in indices):
+            break
+        console.print("[red]Select at least two distinct valid preset numbers.[/red]")
+    print_comparison(cfg, [presets[index] for index in indices], console=console, dtype=dtype)
+
+
+def _view_options(cfg, pc, current, dtype):
+    view = dict(current)
+    dtype = Prompt.ask("Weight precision", choices=list(DTYPE_BYTES), default=dtype)
+    category = Prompt.ask("Kernel category", choices=["all", *CATEGORY_NAMES], default=view.get("category") or "all")
+    view["category"] = None if category == "all" else category
+    for key, label, maximum in (("layer_idx", "Layer", cfg.num_hidden_layers), ("pp_stage", "Stage", pc.pp)):
+        while True:
+            value = Prompt.ask(f"{label} (0–{maximum - 1}, or all)",
+                               default=str(view[key]) if view.get(key) is not None else "all")
+            if value == "all":
+                view[key] = None
+                break
+            if value.isdigit() and int(value) < maximum:
+                view[key] = int(value)
+                break
+            console.print("[red]Enter an available index or all.[/red]")
+    view["show_all"] = Confirm.ask("Show every layer instead of representative layers?", default=view.get("show_all", False))
+    view["detailed"] = Confirm.ask("Show activation, communication and HF tensor details?", default=view.get("detailed", False))
+    return view, dtype
+
+
+def interactive_session(cfg, *, source_dir=None):
+    strategies = detect_strategies(cfg)
+    pc = ParallelConfig()
+    dtype = cfg.raw.get("torch_dtype", "bfloat16")
+    if dtype not in DTYPE_BYTES:
+        dtype = "bfloat16"
+    gpu_budget = None
+    view = {}
+    cache = {}
+    show_model_summary(cfg, dtype, cache=cache)
+    while True:
+        memory = estimate_weight_size(cfg, tp=pc.tp, pp=pc.pp, ep=pc.ep, dtype=dtype, cache=cache)
+        filters = ", ".join(f"{key}={value}" for key, value in view.items() if value is not None and value is not False) or "Compact, representative layers"
+        console.print(Panel(Text(
+            f"{pc} | {pc.world_size} GPUs | Peak weights: {format_bytes(memory)} ({dtype})\n"
+            f"GPU budget: {gpu_budget or 'unlimited'} | View: {filters}"
+        ), title="Current selection", border_style="cyan"))
+        show_action_menu()
+        try:
+            choice = IntPrompt.ask("Action", choices=[str(value) for value in range(8)], default=1)
+            if choice == 0:
+                break
+            if choice == 1:
+                run_analysis(cfg, pc, dtype=dtype, view=view)
+            elif choice == 2:
+                selected_dtype = run_weight_gen(cfg, pc, dtype=dtype, source_dir=source_dir)
+                if selected_dtype:
+                    dtype = selected_dtype
+            elif choice == 3:
+                run_compare(cfg, strategies, gpu_budget=gpu_budget, dtype=dtype, cache=cache)
+            elif choice == 4:
+                selected = custom_config_flow(cfg, strategies, current=pc, gpu_budget=gpu_budget)
+                if selected is not None:
+                    pc = selected
+            elif choice == 5:
+                while True:
+                    value = Prompt.ask("GPU budget (positive integer, or all)", default=str(gpu_budget) if gpu_budget else "all")
+                    if value == "all" or (value.isdigit() and int(value) > 0):
+                        new_budget = None if value == "all" else int(value)
+                        break
+                    console.print("[red]Enter a positive integer or all.[/red]")
+                presets = generate_presets(cfg, strategies, new_budget)
+                show_preset_menu(cfg, presets, dtype, cache=cache)
+                selection = IntPrompt.ask("Preset (0 to cancel)", default=1,
+                                          choices=[str(index) for index in range(len(presets) + 1)])
+                if selection:
+                    pc = replace(presets[selection - 1])
+                    gpu_budget = new_budget
+            elif choice == 6:
+                view, dtype = _view_options(cfg, pc, view, dtype)
+            elif choice == 7:
+                show_strategy_menu(cfg, strategies)
+            if view.get("pp_stage") is not None and view["pp_stage"] >= pc.pp:
+                view["pp_stage"] = None
+        except (OSError, ValueError, ImportError) as error:
+            console.print(Text(str(error), style="red"))
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n[dim]Session ended.[/dim]")
+            break
 
 
 def main():
-    parser = argparse.ArgumentParser(description="AI Infra Parallel Tool — Interactive")
-    parser.add_argument("--config", type=str, help="Path to HF config.json or model dir")
-    parser.add_argument("--model", type=str, help="Model dir path")
+    parser = argparse.ArgumentParser(description="Interactive model sharding analysis")
+    parser.add_argument("--config", help="HF config.json or model directory")
+    parser.add_argument("--model", help="Local model directory")
+    parser.add_argument("--width", type=int, help="Override terminal width")
     args = parser.parse_args()
-
-    # Banner
-    banner = Text()
-    banner.append("╔" + "═" * 58 + "╗\n", style="bright_blue")
-    banner.append("║", style="bright_blue")
-    banner.append(Align.center(Text("🚀 AI Infra Parallel Tool", style=C_TITLE)).render() if False else "")
-    banner.append(" 🚀 AI Infra Parallel Tool                                    ", style=C_TITLE)
-    banner.append("║\n", style="bright_blue")
-    banner.append("║", style="bright_blue")
-    banner.append(" Analyze sharding • Generate random weights • Benchmark      ", style=C_DIM)
-    banner.append("║\n", style="bright_blue")
-    banner.append("╚" + "═" * 58 + "╝", style="bright_blue")
-    console.print(banner)
-
-    # Get config path
-    config_path = args.config or args.model
-    if not config_path:
-        config_path = Prompt.ask("[bold]Path to config.json or model directory[/]")
-    
-    if os.path.isdir(config_path):
-        config_path = os.path.join(config_path, "config.json")
-    if not os.path.exists(config_path):
-        console.print(f"[red]Config not found: {config_path}[/]")
-        return
-
-    # Parse
+    global console
+    if args.width is not None:
+        if args.width < 20:
+            parser.error("--width must be at least 20")
+        console = Console(width=args.width)
     try:
+        path = os.path.expanduser(args.config or args.model or Prompt.ask("Config path or model directory"))
+        config_path = os.path.join(path, "config.json") if os.path.isdir(path) else path
         cfg = parse_config(config_path)
-    except Exception as e:
-        console.print(f"[red]Error: {e}[/]")
-        return
-
-    # Show model summary
-    show_model_summary(cfg)
-
-    # Auto-detect strategies
-    strategies = detect_strategies(cfg)
-    show_strategy_menu(cfg, strategies)
-
-    # Main loop
-    while True:
-        presets = generate_presets(cfg, strategies)
-        console.print()
-        console.print(Rule("[bold]Preset Combinations[/]", style="bright_cyan"))
-        show_preset_menu(cfg, presets)
-
-        show_action_menu()
-        choice = IntPrompt.ask("\n  Choice", default=1)
-
-        if choice == 0:
-            console.print("\n[dim]Bye! 👋[/]")
-            break
-        elif choice == 1:
-            # Analyze
-            console.print("\n[dim]Pick a preset (or 0 for custom):[/]")
-            sel = IntPrompt.ask("  Preset #", default=1)
-            if sel == 0:
-                pc = custom_config_flow(cfg, strategies)
-            elif 1 <= sel <= len(presets):
-                pc = presets[sel - 1]["config"]
-            else:
-                console.print("[red]Invalid[/]")
-                continue
-            run_analysis(cfg, pc)
-        elif choice == 2:
-            # Weight gen
-            console.print("\n[dim]Pick a preset (or 0 for custom):[/]")
-            sel = IntPrompt.ask("  Preset #", default=1)
-            if sel == 0:
-                pc = custom_config_flow(cfg, strategies)
-            elif 1 <= sel <= len(presets):
-                pc = presets[sel - 1]["config"]
-            else:
-                console.print("[red]Invalid[/]")
-                continue
-            run_weight_gen(cfg, pc)
-        elif choice == 3:
-            run_compare(cfg, strategies)
-        elif choice == 4:
-            pc = custom_config_flow(cfg, strategies)
-            console.print(f"\n  [bold]Config: {pc} | World size: {pc.world_size}[/]")
-            sub = IntPrompt.ask("  1=Analyze, 2=Generate weights", default=1)
-            if sub == 1:
-                run_analysis(cfg, pc)
-            else:
-                run_weight_gen(cfg, pc)
-        
-        if not Confirm.ask("\n  Run another action?", default=True):
-            break
-        console.clear()
+        errors = ParallelConfig().validate(cfg, include_warnings=False)
+        if errors:
+            parser.error("; ".join(errors))
+        interactive_session(cfg, source_dir=os.path.dirname(os.path.abspath(config_path)))
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
+    except (EOFError, KeyboardInterrupt):
+        console.print("\n[dim]Session ended.[/dim]")
 
 
 if __name__ == "__main__":
