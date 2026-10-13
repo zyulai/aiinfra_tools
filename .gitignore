@@ -1,0 +1,22 @@
+# Cloned framework sources (too large for this repo)
+sglang/
+vllm/
+Megatron-LM/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Generated model outputs
+*.safetensors
+*.bin
+*.gguf
+
+# Test artifacts
+/tmp/
+.venv/
+venv/
