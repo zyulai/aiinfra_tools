@@ -66,14 +66,15 @@ def build_kernels(cfg: ModelConfig) -> list[KernelSpec]:
     for i in range(cfg.num_hidden_layers):
         prefix = f"model.layers.{i}"
 
-        # Input norm
+        # Input norm — weight is always replicated (1D tensor [hidden_size])
+        # SP affects activation (seq dim), not the weight itself
         kernels.append(KernelSpec(
             name=f"layer_{i}_input_norm",
             category="norm",
             layer_idx=i,
             weight_shape=(h,),
             weight_name=f"{prefix}.input_layernorm.weight",
-            shard_type="replicated" if not cfg.is_gated_mlp else "sequence",
+            shard_type="replicated",
             shard_dim=-1,
             activation_in_shape=(h,),
             activation_out_shape=(h,),
@@ -160,14 +161,16 @@ def build_kernels(cfg: ModelConfig) -> list[KernelSpec]:
         ))
 
         if cfg.is_moe:
-            # Router / gating
+            # Router / gating — naming depends on architecture
+            from weight_gen.weight_shaper import get_moe_naming
+            router_pfx, expert_pfx, gate_name, up_name, down_name = get_moe_naming(cfg.model_type)
             moe_inter = cfg.moe_intermediate_size or inter
             kernels.append(KernelSpec(
                 name=f"layer_{i}_moe_router",
                 category="moe",
                 layer_idx=i,
                 weight_shape=(h, cfg.num_experts),
-                weight_name=f"{prefix}.block_sparse_moe.gate.weight",
+                weight_name=f"{prefix}.{router_pfx}.weight",
                 shard_type="replicated",
                 shard_dim=-1,
                 activation_in_shape=(h,),
@@ -182,7 +185,7 @@ def build_kernels(cfg: ModelConfig) -> list[KernelSpec]:
                 category="moe",
                 layer_idx=i,
                 weight_shape=(h, moe_inter),
-                weight_name=f"{prefix}.mlp.experts.*.gate_proj.weight",
+                weight_name=f"{prefix}.{expert_pfx}.*.{gate_name}.weight",
                 shard_type="expert",
                 shard_dim=-1,
                 activation_in_shape=(h,),
@@ -197,7 +200,7 @@ def build_kernels(cfg: ModelConfig) -> list[KernelSpec]:
                 category="moe",
                 layer_idx=i,
                 weight_shape=(h, moe_inter),
-                weight_name=f"{prefix}.mlp.experts.*.up_proj.weight",
+                weight_name=f"{prefix}.{expert_pfx}.*.{up_name}.weight",
                 shard_type="expert",
                 shard_dim=-1,
                 activation_in_shape=(h,),
@@ -212,7 +215,7 @@ def build_kernels(cfg: ModelConfig) -> list[KernelSpec]:
                 category="moe",
                 layer_idx=i,
                 weight_shape=(moe_inter, h),
-                weight_name=f"{prefix}.mlp.experts.*.down_proj.weight",
+                weight_name=f"{prefix}.{expert_pfx}.*.{down_name}.weight",
                 shard_type="expert",
                 shard_dim=-1,
                 activation_in_shape=(moe_inter,),

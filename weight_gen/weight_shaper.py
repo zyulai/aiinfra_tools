@@ -23,6 +23,22 @@ class WeightEntry:
             self.numel *= d
 
 
+# ── MoE naming conventions by architecture ──
+_MOE_PATTERNS = {
+    # model_type → (router_prefix, expert_prefix, gate_name, up_name, down_name)
+    "qwen2_moe":   ("mlp.gate", "mlp.experts", "gate_proj", "up_proj", "down_proj"),
+    "deepseek_moe": ("mlp.gate", "mlp.experts", "gate_proj", "up_proj", "down_proj"),
+    "mixtral":     ("block_sparse_moe.gate", "block_sparse_moe.experts", "w1", "w3", "w2"),
+    "granite_moe": ("block_sparse_moe.gate", "block_sparse_moe.experts", "w1", "w3", "w2"),
+}
+_DEFAULT_MOE = ("block_sparse_moe.gate", "block_sparse_moe.experts", "gate_proj", "up_proj", "down_proj")
+
+
+def get_moe_naming(model_type: str) -> tuple:
+    """Get MoE weight naming pattern for a model type."""
+    return _MOE_PATTERNS.get(model_type, _DEFAULT_MOE)
+
+
 def build_weight_map(cfg: ModelConfig, pc: ParallelConfig) -> list[WeightEntry]:
     """
     Build the complete list of weight entries for a model.
@@ -124,9 +140,11 @@ def build_weight_map(cfg: ModelConfig, pc: ParallelConfig) -> list[WeightEntry]:
 
         if cfg.is_moe:
             moe_inter = cfg.moe_intermediate_size or inter
+            # Architecture-aware MoE naming
+            router_pfx, expert_pfx, gate_name, up_name, down_name = get_moe_naming(cfg.model_type)
             # Router (replicated)
             entries.append(WeightEntry(
-                name=f"{prefix}.block_sparse_moe.gate.weight",
+                name=f"{prefix}.{router_pfx}.weight",
                 shape=(cfg.num_experts, h),
                 shard_type="replicated",
             ))
@@ -139,17 +157,17 @@ def build_weight_map(cfg: ModelConfig, pc: ParallelConfig) -> list[WeightEntry]:
 
             for e in range(experts_per_rank):
                 entries.append(WeightEntry(
-                    name=f"{prefix}.mlp.experts.{e}.gate_proj.weight",
+                    name=f"{prefix}.{expert_pfx}.{e}.{gate_name}.weight",
                     shape=(tp_inter, h),
                     shard_type="expert" if ep > 1 else ("column" if tp > 1 else "none"),
                 ))
                 entries.append(WeightEntry(
-                    name=f"{prefix}.mlp.experts.{e}.up_proj.weight",
+                    name=f"{prefix}.{expert_pfx}.{e}.{up_name}.weight",
                     shape=(tp_inter, h),
                     shard_type="expert" if ep > 1 else ("column" if tp > 1 else "none"),
                 ))
                 entries.append(WeightEntry(
-                    name=f"{prefix}.mlp.experts.{e}.down_proj.weight",
+                    name=f"{prefix}.{expert_pfx}.{e}.{down_name}.weight",
                     shape=(h, tp_inter),
                     shard_type="expert" if ep > 1 else ("row" if tp > 1 else "none"),
                 ))
