@@ -18,5 +18,6 @@ build/
 
 # Test artifacts
 /tmp/
+.pytest_cache/
 .venv/
 venv/

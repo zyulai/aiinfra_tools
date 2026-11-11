@@ -1,0 +1,19 @@
+[project]
+name = "vllm-perf-sim"
+version = "0.1.0"
+description = "Analytical vLLM serving simulator with bench-serve-compatible metrics"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.scripts]
+vllm-perf-sim = "vllm_perf_sim.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["vllm_perf_sim"]

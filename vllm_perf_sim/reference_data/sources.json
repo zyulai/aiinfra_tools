@@ -1,0 +1,70 @@
+{
+  "notice": "This directory separates verifiable reference data from simulator assumptions. Numbers in hardware.py are vendor hardware specifications, not benchmark results.",
+  "sources": [
+    {
+      "name": "vLLM Benchmark CLI documentation",
+      "url": "https://docs.vllm.ai/en/latest/benchmarking/cli.html",
+      "accessed": "2026-11-11",
+      "kind": "documented_example",
+      "model": "NousResearch/Hermes-3-Llama-3.1-8B",
+      "hardware": "not specified",
+      "dataset": "ShareGPT",
+      "num_prompts": 10,
+      "duration_s": 5.78,
+      "total_input_tokens": 1369,
+      "total_output_tokens": 2212,
+      "request_throughput_req_s": 1.73,
+      "output_throughput_tok_s": 382.89,
+      "total_token_throughput_tok_s": 619.85,
+      "mean_ttft_ms": 71.54,
+      "median_ttft_ms": 73.88,
+      "p99_ttft_ms": 79.49,
+      "mean_tpot_ms": 7.91,
+      "median_tpot_ms": 7.96,
+      "p99_tpot_ms": 8.03,
+      "mean_itl_ms": 7.74,
+      "median_itl_ms": 7.70,
+      "p99_itl_ms": 8.39,
+      "use": "Validate metric names/formulas only. Do not use as A100/H100 calibration."
+    },
+    {
+      "name": "vLLM v0.6.0 performance update",
+      "url": "https://blog.vllm.ai/2024/09/05/perf-update.html",
+      "accessed": "2026-11-11",
+      "kind": "workload_metadata_only",
+      "software": "vLLM v0.6.0, multistep scheduling=10",
+      "hardware": ["1xA100", "4xA100", "1xH100", "4xH100"],
+      "models": ["Llama 3 8B", "Llama 3 70B"],
+      "datasets": [
+        {"name": "ShareGPT", "prompts": 500, "avg_input_tokens": 202, "avg_output_tokens": 179},
+        {"name": "prefill-heavy", "prompts": 500, "avg_input_tokens": 462, "avg_output_tokens": 16},
+        {"name": "decode-heavy", "prompts": 500, "avg_input_tokens": 462, "avg_output_tokens": 256}
+      ],
+      "ttpot_measurement_qps": 32,
+      "throughput_measurement_qps": "inf",
+      "absolute_results": "Embedded charts only; not transcribed into numeric reference rows.",
+      "relative_claims": "8B: 2.7x throughput and 5x TPOT improvement over v0.5.3; 70B: 1.8x and 2x.",
+      "use": "Scenario definitions and qualitative direction, not numeric calibration."
+    },
+    {
+      "name": "NVIDIA H100 Tensor Core GPU datasheet",
+      "url": "https://resources.nvidia.com/en-us-tensor-core/nvidia-tensor-core-gpu-datasheet",
+      "kind": "hardware_specification",
+      "use": "H100 memory, bandwidth and dense tensor compute specifications."
+    },
+    {
+      "name": "NVIDIA A100 Tensor Core GPU datasheet",
+      "url": "https://www.nvidia.com/en-us/data-center/a100/",
+      "kind": "hardware_specification",
+      "use": "A100 memory, bandwidth and dense tensor compute specifications."
+    }
+  ],
+  "assumptions": {
+    "flops_efficiency": "Effective fraction of peak dense tensor FLOPS. Not a measured constant; varies by kernel, shape and version.",
+    "memory_efficiency": "Effective fraction of peak HBM bandwidth. Not a measured constant.",
+    "communication": "Ring all-reduce approximation with a fixed per-collective latency; topology and overlap are simplified.",
+    "cpu_overhead": "Per-step and per-sequence approximations. vLLM version, streaming, detokenization and sampling matter.",
+    "attention": "KV reads and attention FLOPs are modeled; backend-specific paged/flash kernels and CUDA graphs are not cycle-simulated.",
+    "quantization": "Reduced weight/KV bytes are represented; kernel-specific quantization speedup is not automatically assumed."
+  }
+}
