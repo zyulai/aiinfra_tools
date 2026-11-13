@@ -1,0 +1,356 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KV Cache 显存计算器</title>
+<style>
+:root {
+  --background: #f7f7f8; --foreground: #18181b; --card: #ffffff;
+  --card-foreground: #18181b; --muted: #ececee; --muted-foreground: #6b6b74;
+  --border: #e2e2e6; --primary: #27272a; --primary-foreground: #fafafa;
+  --viz-series-1: #3b82f6; --viz-series-2: #f97316; --viz-series-3: #10b981;
+  --viz-series-4: #a855f7;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #131316; --foreground: #f2f2f4; --card: #1c1c20;
+    --card-foreground: #f2f2f4; --muted: #26262c; --muted-foreground: #9a9aa4;
+    --border: #2c2c33; --primary: #f2f2f4; --primary-foreground: #18181b;
+    color-scheme: dark;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; padding: 20px; background: var(--background); color: var(--foreground);
+  font: 400 14px/1.55 system-ui, "Segoe UI", "Microsoft YaHei", sans-serif; }
+main { max-width: 980px; margin: 0 auto; }
+h1 { font-size: 24px; font-weight: 500; margin: 0 0 2px; }
+h3 { font-size: 16px; font-weight: 500; margin: 18px 0 6px; }
+p { margin: 6px 0; }
+code { font-family: ui-monospace, Consolas, monospace; background: var(--muted);
+  padding: 1px 5px; border-radius: 4px; font-size: 12.5px; }
+.text-small { font-size: 12px; }
+.text-muted { color: var(--muted-foreground); }
+.tabular-nums { font-variant-numeric: tabular-nums; }
+.card { background: var(--card); color: var(--card-foreground); border: 1px solid var(--border);
+  border-radius: 10px; padding: 12px 14px; }
+.viz-stat .viz-stat-value { font-size: 20px; font-weight: 500; margin: 2px 0; }
+.viz-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; }
+.viz-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.viz-controls { display: flex; flex-wrap: wrap; gap: 14px 18px; align-items: flex-end; }
+.viz-controls > div { min-width: 130px; }
+.form-label { display: block; font-size: 12px; color: var(--muted-foreground); margin-bottom: 3px; }
+.form-select, .form-control { height: 30px; padding: 2px 8px; border: 1px solid var(--border);
+  border-radius: 7px; background: var(--card); color: var(--foreground); font-size: 13px; }
+.form-select-sm { height: 28px; }
+.form-control-sm { height: 28px; width: 110px; }
+.form-range { width: 150px; accent-color: var(--primary); }
+.table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.table th { text-align: left; color: var(--muted-foreground); font-weight: 500;
+  padding: 5px 8px; border-bottom: 1px solid var(--border); }
+.table td { padding: 5px 8px; border-bottom: 1px solid var(--border); }
+.table-responsive { overflow-x: auto; }
+.text-end { text-align: right; }
+</style>
+</head>
+<body>
+<main>
+<h1>KV Cache 显存计算器</h1>
+<p class="text-small text-muted">离线独立版 · 计算口径与 vLLM 最新 main 分支一致 ·
+配套命令行版:<code>python kv_calculator.py &lt;模型ID&gt;</code></p>
+<div id="kvcalc-root">
+  <style>
+    #kvcalc-root .kvc-bar-row { display: flex; align-items: center; gap: 8px; padding: 2px 0; }
+    #kvcalc-root .kvc-bar-label { width: 190px; flex: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+    #kvcalc-root .kvc-bar-track { flex: 1; min-width: 60px; height: 14px; border-radius: 3px; overflow: hidden; }
+    #kvcalc-root .kvc-bar-fill { height: 100%; border-radius: 3px; }
+    #kvcalc-root .kvc-bar-val { width: 86px; flex: none; text-align: right; font-size: 12px; }
+    #kvcalc-root .kvc-btn-row { background: none; border: 0; padding: 0; width: 100%; text-align: left; cursor: pointer; }
+    #kvcalc-root .kvc-btn-row:hover .kvc-bar-label { text-decoration: underline; }
+    #kvcalc-root .kvc-sel-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 4px; vertical-align: middle; }
+    #kvcalc-root .kvc-hint { font-size: 11px; }
+  </style>
+
+  <h3>KV Cache 显存计算器</h3>
+  <p class="text-muted text-small" style="margin-top:-6px">
+    计算口径与 vLLM 最新 main 分支一致:GQA/MQA · MLA 潜向量 · 交错滑动窗口 · DSA 稀疏索引 ·
+    线性注意力混合 · 跨层共享 · KV 量化 · TP 切分。预设数值取自各模型仓库的真实 config.json。
+  </p>
+
+  <div class="viz-controls">
+    <div>
+      <label class="form-label" for="kvc-model">模型(36 个预设,来自真实 config)</label>
+      <select class="form-select form-select-sm" id="kvc-model"></select>
+    </div>
+    <div>
+      <label class="form-label" for="kvc-dtype">KV cache 精度</label>
+      <select class="form-select form-select-sm" id="kvc-dtype">
+        <option value="2" selected>bf16 / fp16(2 字节)</option>
+        <option value="1">fp8 / int8(1 字节)</option>
+        <option value="0.5">int4(0.5 字节)</option>
+        <option value="0.5625">nvfp4(≈0.56 字节)</option>
+      </select>
+    </div>
+    <div>
+      <label class="form-label" for="kvc-tp">Tensor Parallel</label>
+      <select class="form-select form-select-sm" id="kvc-tp">
+        <option>1</option><option>2</option><option>4</option>
+        <option>8</option><option>16</option><option>32</option>
+      </select>
+    </div>
+    <div>
+      <label class="form-label">序列长度 <span class="text-muted" id="kvc-seq-val">32K</span></label>
+      <input type="range" class="form-range" id="kvc-seq" min="0" max="11" step="1" value="5" aria-label="序列长度(token)">
+    </div>
+    <div>
+      <label class="form-label">并发序列 <span class="text-muted" id="kvc-bat-val">8</span></label>
+      <input type="range" class="form-range" id="kvc-bat" min="1" max="64" step="1" value="8" aria-label="并发序列数">
+    </div>
+    <div>
+      <label class="form-label" for="kvc-budget">KV 显存预算(GB/卡,可空)</label>
+      <input type="number" class="form-control form-control-sm" id="kvc-budget" min="0" step="1" placeholder="如 40">
+    </div>
+  </div>
+
+  <div class="viz-grid" id="kvc-stats" style="margin-top:10px"></div>
+
+  <h3 style="margin-top:14px">各模型每 token KV 对比<span class="text-muted text-small" id="kvc-cmp-note"></span></h3>
+  <div id="kvc-bars" role="list" aria-label="各模型每 token KV 大小对比(点击选择)"></div>
+  <div class="viz-row" style="gap:12px;margin-top:6px">
+    <span class="text-small"><span class="kvc-sel-dot" style="background:var(--viz-series-1)"></span>标准 GQA/MHA</span>
+    <span class="text-small"><span class="kvc-sel-dot" style="background:var(--viz-series-2)"></span>MLA 潜向量</span>
+    <span class="text-small"><span class="kvc-sel-dot" style="background:var(--viz-series-3)"></span>带滑动窗口</span>
+    <span class="text-small"><span class="kvc-sel-dot" style="background:var(--viz-series-4)"></span>混合(线性注意力)</span>
+  </div>
+
+  <h3 style="margin-top:14px">层组明细<span class="text-muted text-small" id="kvc-model-tag"></span></h3>
+  <div class="table-responsive">
+    <table class="table table-sm" id="kvc-table">
+      <thead><tr>
+        <th>层组</th><th>压缩机制</th><th>几何</th><th>窗口/压缩</th>
+        <th class="text-end">每层每 token</th><th class="text-end">合计 B/token</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+  <div id="kvc-notes" class="text-small text-muted" style="margin-top:4px"></div>
+  <p class="text-small text-muted" style="margin-top:8px">
+    公式:每层每 token = (K 维 + V 维) × KV 头数 ÷ TP × 精度字节数;MLA 层 = (kv_lora_rank + qk_rope_head_dim) × 1 × 精度
+    (latent 跨 TP 复制,不除 TP);滑动窗口层缓存 token 数被窗口上限截断;稀疏 MLA 每 N token 存 1 个 latent;
+    DSA 索引每 token 另存 <code>index_head_dim + index_head_dim/128*4</code> <b>字节</b>(uint8 存 fp8 值 + fp32 scale,
+    与 KV 精度无关,见 <code>deepseek_v2.py:731-736</code>);线性注意力层无逐 token KV,改为每请求固定状态
+    (conv 跟模型 dtype,KDA 的 recurrent 恒为 fp32,见 <code>mamba_utils.py:133-149</code>)。
+  </p>
+
+<script>
+const PRESETS = [{"repo": "meta-llama/Llama-3.1-8B-Instruct", "label": "Llama-3.1-8B-Instruct", "family": "llama(GQA: 8 KV头 × 128 维)", "family_key": "Llama 3.x", "max_len": 131072, "dtype": "bfloat16", "heads": 32, "qk_nope": 0, "qk_rope": 0, "v_head": 0, "layers": [{"kind": "full", "n": 32, "kvh": 8, "hs": 128, "hsv": 128, "win": null, "tps": 1, "ih": 0, "ik": 1}], "n_state_layers": 0, "state_bytes": 0, "state_shape": null, "state_desc": "", "shared_layers": 0, "notes": []}, {"repo": "meta-llama/Llama-3.1-70B-Instruct", "label": "Llama-3.1-70B-Instruct", "family": "llama(GQA: 8 KV头 × 128 维)", "family_key": "Llama 3.x", "max_len": 131072, "dtype": "bfloat16", "heads": 64, "qk_nope": 0, "qk_rope": 0, "v_head": 0, "layers": [{"kind": "full", "n": 80, "kvh": 8, "hs": 128, "hsv": 128, "win": null, "tps": 1, "ih": 0, "ik": 1}], "n_state_layers": 0, "state_bytes": 0, "state_shape": null, "state_desc": "", "shared_layers": 0, "notes": []}, {"repo": "meta-llama/Llama-3.3-70B-Instruct", "label": "Llama-3.3-70B-Instruct", "family": "llama(GQA: 8 KV头 × 128 维)", "family_key": "Llama 3.x", "max_len": 131072, "dtype": "bfloat16", "heads": 64, "qk_nope": 0, "qk_rope": 0, "v_head": 0, "layers": [{"kind": "full", "n": 80, "kvh": 8, "hs": 128, "hsv": 128, "win": null, "tps": 1, "ih": 0, "ik": 1}], "n_state_layers": 0, "state_bytes": 0, "state_shape": null, "state_desc": "", "shared_layers": 0, "notes": []}, {"repo": "meta-llama/Llama-3.2-3B-Instruct", "label": "Llama-3.2-3B-Instruct", "family": "llama(GQA: 8 KV头 × 128 维)", "family_key": "Llama 3.x", "max_len": 131072, "dtype": "bfloat16", "heads": 24, "qk_nope": 0, "qk_rope": 0, "v_head": 0, "layers": [{"kind": "full", "n": 28, "kvh": 8, "hs": 128, "hsv": 128, "win": null, "tps": 1, "ih": 0, "ik": 1}], "n_state_layers": 0, "state_bytes": 0, "state_shape": null, "state_desc": "", "shared_layers": 0, "notes": []}, {"repo": "meta-llama/Llama-4-Scout-17B-16E-Instruct", "label": "Llama-4-Scout-17B-16E-Instruct", "family": "llama4_text(GQA+滑动窗口: 8 KV头 × 128 维)", "family_key": "Llama 4", "max_len": 10485760, "dtype": "bfloat16", "heads": 40, "qk_nope": 0, "qk_rope": 0, "v_head": 0, "layers": [{"kind": "swa", "n": 36, "kvh": 8, "hs": 128, "hsv": 128, "win": 8192, "tps": 1, "ih": 0, "ik": 1}, {"kind": "full", "n": 12, "kvh": 8, "hs": 128, "hsv": 128, "win": null, "tps": 1, "ih": 0, "ik": 1}], "n_state_layers": 0, "state_bytes": 0, "state_shape": null, "state_desc": "", "shared_layers": 0, "notes": []}, {"repo": "meta-llama/Llama-4-Maverick-17B-128E-Instruct", "label": "Llama-4-Maverick-17B-128E-Instruct", "family": "llama4_text(GQA+滑动窗口: 8 KV头 × 128 维)", "family_key": "Llama 4", "max_len": 1048576, "dtype": "bfloat16", "heads": 40, "qk_nope": 0, "qk_rope": 0, "v_head": 0, "layers": [{"kind": "swa", "n": 36, "kvh": 8, "hs": 128, "hsv": 128, "win": 8192, "tps": 1, "ih": 0, "ik": 1}, {"kind": "full", "n": 12, "kvh": 8, "hs": 128, "hsv": 128, "win": null, "tps": 1, "ih": 0, "ik": 1}], "n_state_layers": 0, "state_bytes": 0, "state_shape": null, "state_desc": "", "shared_layers": 0, "notes": []}, {"repo": "Qwen/Qwen2.5-32B-Instruct", "label": "Qwen2.5-32B-Instruct", "family": "qwen2(GQA: 8 KV头 × 128 维)", "family_key": "Qwen2.5", "max_len": 32768, "dtype": "bfloat16", "heads": 40, "qk_nope": 0, "qk_rope": 0, "v_head": 0, "layers": [{"kind": "full", "n": 64, "kvh": 8, "hs": 128, "hsv": 128, "win": null, "tps": 1, "ih": 0, "ik": 1}], "n_state_layers": 0, "state_bytes": 0, "state_shape": null, "state_desc": "", "shared_layers": 0, "notes": []}, {"repo": "Qwen/Qwen2.5-72B-Instruct", "label": "Qwen2.5-72B-Instruct", "family": "qwen2(GQA: 8 KV头 × 128 维)", "family_key": "Qwen2.5", "max_len": 32768, "dtype": "bfloat16", "heads": 64, "qk_nope": 0, "qk_rope": 0, "v_head": 0, "layers": [{"kind": "full", "n": 80, "kvh": 8, "hs": 128, "hsv": 128, "win": null, "tps": 1, "ih": 0, "ik": 1}], "n_state_layers": 0, "state_bytes": 0, "state_shape": null, "state_desc": "", "shared_layers": 0, "notes": []}, {"repo": "Qwen/Qwen3-4B-Instruct-2507", "label": "Qwen3-4B-Instruct-2507", "family": "qwen3(GQA: 8 KV头 × 128 维)", "family_key": "Qwen3", "max_len": 262144, "dtype": "bfloat16", "heads": 32, "qk_nope": 0, "qk_rope": 0, "v_head": 0, "layers": [{"kind": "full", "n": 36, "kvh": 8, "hs": 128, "hsv": 128, "win": null, "tps": 1, "ih": 0, "ik": 1}], "n_state_layers": 0, "state_bytes": 0, "state_shape": null, "state_desc": "", "shared_layers": 0, "notes": []}, {"repo": "Qwen/Qwen3-32B", "label": "Qwen3-32B", "family": "qwen3(GQA: 8 KV头 × 128 维)", "family_key": "Qwen3", "max_len": 40960, "dtype": "bfloat16", "heads": 64, "qk_nope": 0, "qk_rope": 0, "v_head": 0, "layers": [{"kind": "full", "n": 64, "kvh": 8, "hs": 128, "hsv": 128, "win": null, "tps": 1, "ih": 0, "ik": 1}], "n_state_layers": 0, "state_bytes": 0, "state_shape": null, "state_desc": "", "shared_layers": 0, "notes": []}, {"repo": "Qwen/Qwen3-235B-A22B-Instruct-2507", "label": "Qwen3-235B-A22B-Instruct-2507", "family": "qwen3_moe(GQA: 4 KV头 × 128 维)", "family_key": "Qwen3-MoE", "max_len": 262144, "dtype": "bfloat16", "heads": 64, "qk_nope": 0, "qk_rope": 0, "v_head": 0, "layers": [{"kind": "full", "n": 94, "kvh": 4, "hs": 128, "hsv": 128, "win": null, "tps": 1, "ih": 0, "ik": 1}], "n_state_layers": 0, "state_bytes": 0, "state_shape": null, "state_desc": "", "shared_layers": 0, "notes": []}, {"repo": "Qwen/Qwen3-Next-80B-A3B-Instruct", "label": "Qwen3-Next-80B-A3B-Instruct", "family": "qwen3_next(GQA+线性注意力混合: 2 KV头 × 256 维)", "family_key": "Qwen3-Next", "max_len": 262144, "dtype": "bfloat16", "heads": 16, "qk_nope": 0, "qk_rope": 0, "v_head": 0, "layers": [{"kind": "full", "n": 12, "kvh": 2, "hs": 256, "hsv": 256, "win": null, "tps": 1, "ih": 0, "ik": 1}], "n_state_layers": 36, "state_bytes": 39518208, "state_shape": {"conv_dim": 8192, "conv_len": 3, "conv_elem": 2, "temporal_numel": 524288, "temporal_elem": 2, "groups": 0, "state_size": 0}, "state_desc": "GDN 状态: conv 8192×3 + temporal 32×128×128", "shared_layers": 0, "notes": []}, {"repo": "Qwen/Qwen3-Coder-30B-A3B-Instruct", "label": "Qwen3-Coder-30B-A3B-Instruct", "family": "qwen3_moe(GQA: 4 KV头 × 128 维)", "family_key": "Qwen3-MoE", "max_len": 262144, "dtype": "bfloat16", "heads": 32, "qk_nope": 0, "qk_rope": 0, "v_head": 0, "layers": [{"kind": "full", "n": 48, "kvh": 4, "hs": 128, "hsv": 128, "win": null, "tps": 1, "ih": 0, "ik": 1}], "n_state_layers": 0, "state_bytes": 0, "state_shape": null, "state_desc": "", "shared_layers": 0, "notes": []}, {"repo": "Qwen/Qwen3.5-4B", "label": "Qwen3.5-4B", "family": "qwen3_5_text(GQA+线性注意力混合: 4 KV头 × 256 维)", "family_key": "qwen3_5_text", "max_len": 262144, "dtype": "bfloat16", "heads": 16, "qk_nope": 0, "qk_rope": 0, "v_head": 0, "layers": [{"kind": "full", "n": 8, "kvh": 4, "hs": 256, "hsv": 256, "win": null, "tps": 1, "ih": 0, "ik": 1}], "n_state_layers": 24, "state_bytes": 26345472, "state_shape": {"conv_dim": 8192, "conv_len": 3, "conv_elem": 2, "temporal_numel": 524288, "temporal_elem": 2, "groups": 0, "state_size": 0}, "state_desc": "GDN 状态: conv 8192×3 + temporal 32×128×128", "shared_layers": 0, "notes": []}, {"repo": "deepseek-ai/DeepSeek-V2-0628", "label": "DeepSeek-V2-0628", "family": "deepseek_v2(MLA:每层每 token 一个 576 维 latent,无 K/V 分离,无 GQA)", "family_key": "DeepSeek-V2.5", "max_len": 163840, "dtype": "bfloat16", "heads": 128, "qk_nope": 128, "qk_rope": 64, "v_head": 128, "layers": [{"kind": "mla", "n": 60, "kvh": 1, "hs": 576, "hsv": 576, "win": null, "tps": 1, "ih": 0, "ik": 1}], "n_state_layers": 0, "state_bytes": 0, "state_shape": null, "state_desc": "", "shared_layers": 0, "notes": []}, {"repo": "deepseek-ai/DeepSeek-V3", "label": "DeepSeek-V3", "family": "deepseek_v3(MLA:每层每 token 一个 576 维 latent,无 K/V 分离,无 GQA)", "family_key": "DeepSeek-V3/R1", "max_len": 163840, "dtype": "bfloat16", "heads": 128, "qk_nope": 128, "qk_rope": 64, "v_head": 128, "layers": [{"kind": "mla", "n": 61, "kvh": 1, "hs": 576, "hsv": 576, "win": null, "tps": 1, "ih": 0, "ik": 1}], "n_state_layers": 0, "state_bytes": 0, "state_shape": null, "state_desc": "", "shared_layers": 0, "notes": []}, {"repo": "deepseek-ai/DeepSeek-R1", "label": "DeepSeek-R1", "family": "deepseek_v3(MLA:每层每 token 一个 576 维 latent,无 K/V 分离,无 GQA)", "family_key": "DeepSeek-V3/R1", "max_len": 163840, "dtype": "bfloat16", "heads": 128, "qk_nope": 128, "qk_rope": 64, "v_head": 128, "layers": [{"kind": "mla", "n": 61, "kvh": 1, "hs": 576, "hsv": 576, "win": null, "tps": 1, "ih": 0, "ik": 1}], "n_state_layers": 0, "state_bytes": 0, "state_shape": null, "state_desc": "", "shared_layers": 0, "notes": []}, {"repo": "deepseek-ai/DeepSeek-V3.2-Exp", "label": "DeepSeek-V3.2-Exp", "family": "deepseek_v32(MLA:每层每 token 一个 576 维 latent,无 K/V 分离,无 GQA)", "family_key": "DeepSeek-V3.2(DSA)", "max_len": 163840, "dtype": "bfloat16", "heads": 128, "qk_nope": 128, "qk_rope": 64, "v_head": 128, "layers": [{"kind": "mla", "n": 61, "kvh": 1, "hs": 576, "hsv": 576, "win": null, "tps": 1, "ih": 128, "ik": 1}], "n_state_layers": 0, "state_bytes": 0, "state_shape": null, "state_desc": "", "shared_layers": 0, "notes": ["DSA/dspark indexer:每 token 额外 132 B (uint8 存 128 维 fp8 值 + fp32 scale)"]}, {"repo": "moonshotai/Kimi-K2-Instruct", "label": "Kimi-K2-Instruct", "family": "kimi_k2(MLA:每层每 token 一个 576 维 latent,无 K/V 分离,无 GQA)", "family_key": "Kimi K2", "max_len": 131072, "dtype": "bfloat16", "heads": 64, "qk_nope": 128, "qk_rope": 64, "v_head": 128, "layers": [{"kind": "mla", "n": 61, "kvh": 1, "hs": 576, "hsv": 576, "win": null, "tps": 1, "ih": 0, "ik": 1}], "n_state_layers": 0, "state_bytes": 0, "state_shape": null, "state_desc": "", "shared_layers": 0, "notes": []}, {"repo": "zai-org/GLM-4.5-Air", "label": "GLM-4.5-Air", "family": "glm4_moe(GQA: 8 KV头 × 128 维)", "family_key": "GLM-4.5/4.6", "max_len": 131072, "dtype": "bfloat16", "heads": 96, "qk_nope": 0, "qk_rope": 0, "v_head": 0, "layers": [{"kind": "full", "n": 46, "kvh": 8, "hs": 128, "hsv": 128, "win": null, "tps": 1, "ih": 0, "ik": 1}], "n_state_layers": 0, "state_bytes": 0, "state_shape": null, "state_desc": "", "shared_layers": 0, "notes": []}, {"repo": "zai-org/GLM-4.5", "label": "GLM-4.5", "family": "glm4_moe(GQA: 8 KV头 × 128 维)", "family_key": "GLM-4.5/4.6", "max_len": 131072, "dtype": "bfloat16", "heads": 96, "qk_nope": 0, "qk_rope": 0, "v_head": 0, "layers": [{"kind": "full", "n": 92, "kvh": 8, "hs": 128, "hsv": 128, "win": null, "tps": 1, "ih": 0, "ik": 1}], "n_state_layers": 0, "state_bytes": 0, "state_shape": null, "state_desc": "", "shared_layers": 0, "notes": []}, {"repo": "zai-org/GLM-4.6", "label": "GLM-4.6", "family": "glm4_moe(GQA: 8 KV头 × 128 维)", "family_key": "GLM-4.5/4.6", "max_len": 202752, "dtype": "bfloat16", "heads": 96, "qk_nope": 0, "qk_rope": 0, "v_head": 0, "layers": [{"kind": "full", "n": 92, "kvh": 8, "hs": 128, "hsv": 128, "win": null, "tps": 1, "ih": 0, "ik": 1}], "n_state_layers": 0, "state_bytes": 0, "state_shape": null, "state_desc": "", "shared_layers": 0, "notes": []}, {"repo": "openai/gpt-oss-20b", "label": "gpt-oss-20b", "family": "gpt_oss(GQA+滑动窗口: 8 KV头 × 64 维)", "family_key": "gpt-oss", "max_len": 131072, "dtype": "bfloat16", "heads": 64, "qk_nope": 0, "qk_rope": 0, "v_head": 0, "layers": [{"kind": "swa", "n": 12, "kvh": 8, "hs": 64, "hsv": 64, "win": 128, "tps": 1, "ih": 0, "ik": 1}, {"kind": "full", "n": 12, "kvh": 8, "hs": 64, "hsv": 64, "win": null, "tps": 1, "ih": 0, "ik": 1}], "n_state_layers": 0, "state_bytes": 0, "state_shape": null, "state_desc": "", "shared_layers": 0, "notes": []}, {"repo": "openai/gpt-oss-120b", "label": "gpt-oss-120b", "family": "gpt_oss(GQA+滑动窗口: 8 KV头 × 64 维)", "family_key": "gpt-oss", "max_len": 131072, "dtype": "bfloat16", "heads": 64, "qk_nope": 0, "qk_rope": 0, "v_head": 0, "layers": [{"kind": "swa", "n": 18, "kvh": 8, "hs": 64, "hsv": 64, "win": 128, "tps": 1, "ih": 0, "ik": 1}, {"kind": "full", "n": 18, "kvh": 8, "hs": 64, "hsv": 64, "win": null, "tps": 1, "ih": 0, "ik": 1}], "n_state_layers": 0, "state_bytes": 0, "state_shape": null, "state_desc": "", "shared_layers": 0, "notes": []}, {"repo": "google/gemma-2-9b-it", "label": "gemma-2-9b-it", "family": "gemma2(GQA+滑动窗口: 8 KV头 × 256 维)", "family_key": "Gemma-2", "max_len": 8192, "dtype": "bfloat16", "heads": 16, "qk_nope": 0, "qk_rope": 0, "v_head": 0, "layers": [{"kind": "swa", "n": 21, "kvh": 8, "hs": 256, "hsv": 256, "win": 4096, "tps": 1, "ih": 0, "ik": 1}, {"kind": "full", "n": 21, "kvh": 8, "hs": 256, "hsv": 256, "win": null, "tps": 1, "ih": 0, "ik": 1}], "n_state_layers": 0, "state_bytes": 0, "state_shape": null, "state_desc": "", "shared_layers": 0, "notes": []}, {"repo": "google/gemma-3-4b-it", "label": "gemma-3-4b-it", "family": "gemma3_text(GQA+滑动窗口: 4 KV头 × 256 维)", "family_key": "Gemma-3", "max_len": 131072, "dtype": "bfloat16", "heads": 8, "qk_nope": 0, "qk_rope": 0, "v_head": 0, "layers": [{"kind": "swa", "n": 29, "kvh": 4, "hs": 256, "hsv": 256, "win": 1024, "tps": 1, "ih": 0, "ik": 1}, {"kind": "full", "n": 5, "kvh": 4, "hs": 256, "hsv": 256, "win": null, "tps": 1, "ih": 0, "ik": 1}], "n_state_layers": 0, "state_bytes": 0, "state_shape": null, "state_desc": "", "shared_layers": 0, "notes": []}, {"repo": "google/gemma-3-27b-it", "label": "gemma-3-27b-it", "family": "gemma3_text(GQA+滑动窗口: 16 KV头 × 128 维)", "family_key": "Gemma-3", "max_len": 131072, "dtype": "bfloat16", "heads": 32, "qk_nope": 0, "qk_rope": 0, "v_head": 0, "layers": [{"kind": "swa", "n": 52, "kvh": 16, "hs": 128, "hsv": 128, "win": 1024, "tps": 1, "ih": 0, "ik": 1}, {"kind": "full", "n": 10, "kvh": 16, "hs": 128, "hsv": 128, "win": null, "tps": 1, "ih": 0, "ik": 1}], "n_state_layers": 0, "state_bytes": 0, "state_shape": null, "state_desc": "", "shared_layers": 0, "notes": []}, {"repo": "google/gemma-3-1b-it", "label": "gemma-3-1b-it", "family": "gemma3_text(GQA+滑动窗口: 1 KV头 × 256 维)", "family_key": "Gemma-3", "max_len": 32768, "dtype": "bfloat16", "heads": 4, "qk_nope": 0, "qk_rope": 0, "v_head": 0, "layers": [{"kind": "swa", "n": 22, "kvh": 1, "hs": 256, "hsv": 256, "win": 512, "tps": 1, "ih": 0, "ik": 1}, {"kind": "full", "n": 4, "kvh": 1, "hs": 256, "hsv": 256, "win": null, "tps": 1, "ih": 0, "ik": 1}], "n_state_layers": 0, "state_bytes": 0, "state_shape": null, "state_desc": "", "shared_layers": 0, "notes": []}, {"repo": "google/gemma-3n-E4B-it", "label": "gemma-3n-E4B-it", "family": "gemma3n_text(GQA+滑动窗口+跨层共享(后 15 层复用): 2 KV头 × 256 维)", "family_key": "Gemma-3n", "max_len": 32768, "dtype": "bfloat16", "heads": 8, "qk_nope": 0, "qk_rope": 0, "v_head": 0, "layers": [{"kind": "swa", "n": 16, "kvh": 2, "hs": 256, "hsv": 256, "win": 512, "tps": 1, "ih": 0, "ik": 1}, {"kind": "full", "n": 4, "kvh": 2, "hs": 256, "hsv": 256, "win": null, "tps": 1, "ih": 0, "ik": 1}], "n_state_layers": 0, "state_bytes": 0, "state_shape": null, "state_desc": "", "shared_layers": 15, "notes": []}, {"repo": "mistralai/Mistral-Small-24B-Instruct-2501", "label": "Mistral-Small-24B-Instruct-2501", "family": "mistral(GQA: 8 KV头 × 128 维)", "family_key": "Mistral", "max_len": 32768, "dtype": "bfloat16", "heads": 32, "qk_nope": 0, "qk_rope": 0, "v_head": 0, "layers": [{"kind": "full", "n": 40, "kvh": 8, "hs": 128, "hsv": 128, "win": null, "tps": 1, "ih": 0, "ik": 1}], "n_state_layers": 0, "state_bytes": 0, "state_shape": null, "state_desc": "", "shared_layers": 0, "notes": []}, {"repo": "mistralai/Mistral-Small-3.2-24B-Instruct-2506", "label": "Mistral-Small-3.2-24B-Instruct-2506", "family": "mistral(GQA: 8 KV头 × 128 维)", "family_key": "Mistral", "max_len": 131072, "dtype": "bfloat16", "heads": 32, "qk_nope": 0, "qk_rope": 0, "v_head": 0, "layers": [{"kind": "full", "n": 40, "kvh": 8, "hs": 128, "hsv": 128, "win": null, "tps": 1, "ih": 0, "ik": 1}], "n_state_layers": 0, "state_bytes": 0, "state_shape": null, "state_desc": "", "shared_layers": 0, "notes": []}, {"repo": "MiniMaxAI/MiniMax-M2", "label": "MiniMax-M2", "family": "minimax_m2(GQA: 8 KV头 × 128 维)", "family_key": "MiniMax-M2", "max_len": 196608, "dtype": "bfloat16", "heads": 48, "qk_nope": 0, "qk_rope": 0, "v_head": 0, "layers": [{"kind": "full", "n": 62, "kvh": 8, "hs": 128, "hsv": 128, "win": null, "tps": 1, "ih": 0, "ik": 1}], "n_state_layers": 0, "state_bytes": 0, "state_shape": null, "state_desc": "", "shared_layers": 0, "notes": []}, {"repo": "microsoft/phi-4", "label": "phi-4", "family": "phi3(GQA: 10 KV头 × 128 维)", "family_key": "Phi-4", "max_len": 16384, "dtype": "bfloat16", "heads": 40, "qk_nope": 0, "qk_rope": 0, "v_head": 0, "layers": [{"kind": "full", "n": 40, "kvh": 10, "hs": 128, "hsv": 128, "win": null, "tps": 1, "ih": 0, "ik": 1}], "n_state_layers": 0, "state_bytes": 0, "state_shape": null, "state_desc": "", "shared_layers": 0, "notes": []}, {"repo": "LiquidAI/LFM2-8B-A1B", "label": "LFM2-8B-A1B", "family": "lfm2_moe(GQA+线性注意力混合: 8 KV头 × 64 维)", "family_key": "lfm2_moe", "max_len": 128000, "dtype": "bfloat16", "heads": 32, "qk_nope": 0, "qk_rope": 0, "v_head": 0, "layers": [{"kind": "full", "n": 6, "kvh": 8, "hs": 64, "hsv": 64, "win": null, "tps": 1, "ih": 0, "ik": 1}], "n_state_layers": 18, "state_bytes": 147456, "state_shape": {"conv_dim": 2048, "conv_len": 2, "conv_elem": 2, "temporal_numel": 0, "temporal_elem": 2, "groups": 0, "state_size": 0}, "state_desc": "短卷积状态 2048×2", "shared_layers": 0, "notes": []}, {"repo": "tiiuae/Falcon-H1-34B-Instruct", "label": "Falcon-H1-34B-Instruct", "family": "falcon_h1(GQA+线性注意力混合: 4 KV头 × 128 维)", "family_key": "Falcon-H1", "max_len": 262144, "dtype": "bfloat16", "heads": 20, "qk_nope": 0, "qk_rope": 0, "v_head": 0, "layers": [{"kind": "full", "n": 72, "kvh": 4, "hs": 128, "hsv": 128, "win": null, "tps": 1, "ih": 0, "ik": 1}], "n_state_layers": 72, "state_bytes": 153206784, "state_shape": {"conv_dim": 5120, "conv_len": 3, "conv_elem": 2, "temporal_numel": 1048576, "temporal_elem": 2, "groups": 2, "state_size": 256}, "state_desc": "Mamba2 状态: conv 5120×3 + ssm 32×128×256", "shared_layers": 0, "notes": []}, {"repo": "baidu/ERNIE-4.5-300B-A47B-PT", "label": "ERNIE-4.5-300B-A47B-PT", "family": "ernie4_5_moe(GQA: 8 KV头 × 128 维)", "family_key": "ernie4_5_moe", "max_len": 131072, "dtype": "bfloat16", "heads": 64, "qk_nope": 0, "qk_rope": 0, "v_head": 0, "layers": [{"kind": "full", "n": 54, "kvh": 8, "hs": 128, "hsv": 128, "win": null, "tps": 1, "ih": 0, "ik": 1}], "n_state_layers": 0, "state_bytes": 0, "state_shape": null, "state_desc": "", "shared_layers": 0, "notes": []}];
+
+const SEQ_STEPS = [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576];
+const KIND_CN = { full: "全注意力", swa: "滑动窗口", mla: "MLA", sparse_mla: "稀疏 MLA" };
+const $ = (id) => document.getElementById(id);
+const root = $("kvcalc-root");
+
+function seriesColor(p) {
+  const hasMla = p.layers.some(g => g.kind === "mla" || g.kind === "sparse_mla");
+  const hasLinear = p.n_state_layers > 0;
+  const hasSwa = p.layers.some(g => g.kind === "swa");
+  if (hasLinear) return "var(--viz-series-4)";
+  if (hasMla) return "var(--viz-series-2)";
+  if (hasSwa) return "var(--viz-series-3)";
+  return "var(--viz-series-1)";
+}
+function tpKvh(g, tp) {
+  if (g.kind === "mla" || g.kind === "sparse_mla") return g.kvh;  // MLA latent 不切分
+  return Math.max(1, Math.floor(g.kvh / tp));
+}
+function groupPerToken(g, db, tp) {
+  const kvh = tpKvh(g, tp);
+  const per = (g.kind === "mla" || g.kind === "sparse_mla")
+    ? g.hs * kvh * db
+    : (g.hs + g.hsv) * kvh * db;
+  // DSA indexer:vLLM 用 uint8 存 fp8 值 + 每 128 元素 4B fp32 scale
+  // [deepseek_v2.py:731-736],与 kv dtype 无关
+  const idx = g.ih ? (g.ih + Math.floor(g.ih / 128) * 4) / (g.ik || 1) : 0;
+  return per / (g.tps || 1) + idx;
+}
+function perToken(p, db, tp) {
+  return p.layers.reduce((s, g) => s + groupPerToken(g, db, tp) * g.n, 0);
+}
+function statePerReq(p, tp) {
+  // 固定状态按每请求一份计。conv 通道 / TP;Mamba2 的 n_groups < TP 时
+  // conv 通道先扩到 TP 组再除 [mamba_utils.extra_groups_for_head_shards]
+  const s = p.state_shape;
+  if (!s || !p.n_state_layers) return 0;
+  let convDim = s.conv_dim;
+  if (s.groups && tp > s.groups) convDim += 2 * (tp - s.groups) * s.state_size;
+  const perLayer = Math.floor(convDim / tp) * s.conv_len * s.conv_elem
+                 + Math.floor(s.temporal_numel / tp) * s.temporal_elem;
+  return perLayer * p.n_state_layers;
+}
+function bytesAtLen(p, L, db, tp) {
+  let total = 0;
+  for (const g of p.layers) {
+    const eff = g.kind === "swa" ? Math.min(L, g.win || L) : L;
+    total += groupPerToken(g, db, tp) * g.n * eff;
+  }
+  total += statePerReq(p, tp);
+  return total;
+}
+function mhaRef(p, db) {
+  let mha = 0;
+  for (const g of p.layers) {
+    let hk = g.hs, hv = g.hsv;
+    if (g.kind === "mla" || g.kind === "sparse_mla") {
+      hk = (p.qk_nope + p.qk_rope) || g.hs;
+      hv = p.v_head || g.hs;
+    }
+    mha += p.heads * (hk + hv) * db * g.n / (g.tps || 1);
+  }
+  return mha;
+}
+function fmtB(n) {
+  const u = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  while (Math.abs(n) >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return (i === 0 ? Math.round(n) : n.toFixed(n >= 100 ? 0 : n >= 10 ? 1 : 2)) + " " + u[i];
+}
+function fmtK(n) { return n >= 1048576 ? (n/1048576).toFixed(1) + "M" : n >= 1024 ? Math.round(n/1024) + "K" : String(n); }
+
+function initSelect() {
+  const sel = $("kvc-model");
+  const groups = {};
+  for (const p of PRESETS) (groups[p.family_key] = groups[p.family_key] || []).push(p);
+  const order = Object.keys(groups);
+  for (const fk of order) {
+    const og = document.createElement("optgroup");
+    og.label = fk;
+    for (const p of groups[fk]) {
+      const o = document.createElement("option");
+      o.value = PRESETS.indexOf(p);
+      o.textContent = p.label;
+      og.appendChild(o);
+    }
+    sel.appendChild(og);
+  }
+  const idx = PRESETS.findIndex(p => p.label.includes("Llama-3.1-70B"));
+  sel.value = String(idx >= 0 ? idx : 0);
+}
+
+function readState() {
+  return {
+    model: +$("kvc-model").value,
+    db: +$("kvc-dtype").value,
+    tp: +$("kvc-tp").value,
+    L: SEQ_STEPS[+$("kvc-seq").value],
+    batch: +$("kvc-bat").value,
+    budget: $("kvc-budget").value ? parseFloat($("kvc-budget").value) : null,
+  };
+}
+
+function render() {
+  const st = readState();
+  const p = PRESETS[st.model];
+  const { db, tp, L, batch, budget } = st;
+  $("kvc-seq-val").textContent = fmtK(L);
+  $("kvc-bat-val").textContent = batch;
+
+  const pt = perToken(p, db, tp);
+  const mha = mhaRef(p, db);
+  const oneSeq = bytesAtLen(p, L, db, tp);
+  const batchTotal = oneSeq * batch;
+  const statePer = statePerReq(p, tp);
+  const budgetGB = budget ? budget * 1024 ** 3 : null;
+
+  const stats = [
+    { label: "每 token KV(单卡)", value: fmtB(pt),
+      sub: mha ? "同规模 MHA 的 1/" + (mha / Math.max(pt, 1)).toFixed(1) : "" },
+    { label: "单序列 @ " + fmtK(L) + " token(单卡)", value: fmtB(oneSeq),
+      sub: statePer ? "含固定状态 " + fmtB(statePer) : "" },
+    { label: batch + " 并发合计(单卡)", value: fmtB(batchTotal),
+      sub: "TP=" + tp + (p.layers.some(g => g.kind === "mla" || g.kind === "sparse_mla") ? " · MLA latent 跨卡复制不除 TP" : " · KV 头已按 TP 切分") },
+  ];
+  if (budgetGB) {
+    const maxSeqs = Math.floor(budgetGB / Math.max(1, oneSeq));
+    // 上限取模型最大长度:纯滑窗模型超过窗口后容量不再增长
+    let lo = 1, hi = p.max_len ? Math.min(p.max_len, 1048576 * 16) : 1048576 * 16;
+    while (lo < hi) { const mid = Math.ceil((lo + hi) / 2); (bytesAtLen(p, mid, db, tp) <= budgetGB) ? lo = mid : hi = mid - 1; }
+    const capped = p.max_len && lo >= p.max_len ? "(已封顶)" : "";
+    stats.push({ label: "预算 " + budget + " GB 可容纳", value: fmtK(lo) + " token" + capped,
+      sub: "≈ " + maxSeqs + " 条 " + fmtK(L) + " 序列(单卡)" });
+  }
+  $("kvc-stats").innerHTML = stats.map(s =>
+    '<div class="card viz-stat"><div class="text-muted text-small">' + s.label +
+    '</div><div class="viz-stat-value">' + s.value + '</div>' +
+    (s.sub ? '<div class="text-muted kvc-hint">' + s.sub + "</div>" : "") + "</div>").join("");
+
+  // 对比条形图
+  $("kvc-cmp-note").textContent = " · bf16 口径 · 点击切换模型";
+  const rows = PRESETS.map(pp => ({ p: pp, v: perToken(pp, 2, 1) }))
+    .sort((a, b) => b.v - a.v);
+  const max = rows[0].v;
+  $("kvc-bars").innerHTML = rows.map(r =>
+    '<button type="button" class="kvc-btn-row" role="listitem" data-idx="' + PRESETS.indexOf(r.p) + '"' +
+    (r.p === p ? ' aria-pressed="true" style="font-weight:500"' : "") + '>' +
+    '<span class="kvc-bar-row">' +
+    '<span class="kvc-bar-label">' + (r.p === p ? "● " : "") + r.p.label + "</span>" +
+    '<span class="kvc-bar-track" style="background:var(--muted)">' +
+    '<span class="kvc-bar-fill" style="width:' + (r.v / max * 100).toFixed(1) + "%;background:" + seriesColor(r.p) + '"></span></span>' +
+    '<span class="kvc-bar-val tabular-nums">' + fmtB(r.v) + "</span></span></button>").join("");
+  root.querySelectorAll(".kvc-btn-row").forEach(b => b.addEventListener("click", () => {
+    $("kvc-model").value = b.dataset.idx; render(); save();
+  }));
+
+  // 明细表
+  $("kvc-model-tag").textContent = " · " + p.label + " · " + p.family;
+  const tb = $("kvc-table").querySelector("tbody");
+  tb.innerHTML = p.layers.map(g => {
+    const win = g.kind === "swa" ? "w=" + fmtK(g.win) : (g.tps > 1 ? "1 latent / " + g.tps + " token" : "—");
+    const geo = (g.kind === "mla" || g.kind === "sparse_mla")
+      ? g.hs + " 维 latent"
+      : "K " + g.hs + " + V " + g.hsv + " × " + g.kvh + " 头";
+    const idxNote = g.ih ? " +" + g.ih + "d索引" + (g.ik > 1 ? "/" + g.ik : "") : "";
+    return "<tr><td>" + g.n + " 层</td><td>" + KIND_CN[g.kind] + idxNote + "</td><td>" + geo +
+      "</td><td>" + win + "</td><td class=\"text-end tabular-nums\">" + fmtB(groupPerToken(g, db, 1)) +
+      "</td><td class=\"text-end tabular-nums\">" + fmtB(groupPerToken(g, db, tp) * g.n) + "</td></tr>";
+  }).join("") +
+    (p.shared_layers ? '<tr><td>' + p.shared_layers + ' 层</td><td>跨层共享</td><td colspan="4">复用同类型前序层的 KV,不占显存</td></tr>' : "") +
+    (p.n_state_layers ? '<tr><td>' + p.n_state_layers + ' 层</td><td>线性注意力</td><td>' + p.state_desc +
+      '</td><td>固定状态</td><td class="text-end tabular-nums">' + fmtB(statePer / p.n_state_layers) + '</td><td class="text-end tabular-nums">每请求 ' + fmtB(statePer) + "</td></tr>" : "");
+
+  $("kvc-notes").innerHTML = (p.notes || []).map(n => "※ " + n).join("<br>") +
+    (p.max_len ? (p.notes.length ? "<br>" : "") + "※ 模型最大长度 " + fmtK(p.max_len) + " token" : "");
+
+  if (window.zcode && window.zcode.setWidgetState) {
+    window.zcode.setWidgetState({ privateContent: st }).catch(() => {});
+  }
+}
+
+function save() { render(); }
+
+function boot() {
+  initSelect();
+  if (window.zcode && window.zcode.widgetState) {
+    try {
+      const ws = window.zcode.widgetState && window.zcode.widgetState();
+      if (ws && ws.privateContent) {
+        const s = ws.privateContent;
+        if (s.model != null) $("kvc-model").value = String(s.model);
+        if (s.db != null) $("kvc-dtype").value = String(s.db);
+        if (s.tp != null) $("kvc-tp").value = String(s.tp);
+        if (s.L != null) { const i = SEQ_STEPS.indexOf(s.L); if (i >= 0) $("kvc-seq").value = i; }
+        if (s.batch != null) $("kvc-bat").value = s.batch;
+      }
+    } catch (e) {}
+  }
+  ["kvc-model", "kvc-dtype", "kvc-tp", "kvc-seq", "kvc-bat", "kvc-budget"].forEach(id =>
+    $(id).addEventListener("input", render));
+  render();
+}
+boot();
+</script>
+</div>
+
+</main>
+</body>
+</html>
